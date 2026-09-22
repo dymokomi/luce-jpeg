@@ -1,0 +1,19 @@
+#prisma 4.0
+def package "luce-jpeg" {
+    str owner = "dymokomi"
+    str version = "0.1.0"
+    str kind = "package"
+    str language = "luce-base"
+    str description = "A baseline and progressive JPEG decoder and a baseline encoder for Luce/Base."
+    str readme = "README.md"
+
+    def dependency "luce-raster" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-raster"
+    }
+
+    def export "jpeg" {
+        str module = "luce_jpeg.jpeg"
+    }
+}
