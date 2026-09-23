@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-jpeg" {
     str owner = "dymokomi"
-    str version = "0.1.0"
+    str version = "0.1.1"
     str kind = "package"
     str language = "luce-base"
     str description = "A baseline and progressive JPEG decoder and a baseline encoder for Luce/Base."
@@ -15,5 +15,11 @@ def package "luce-jpeg" {
 
     def export "jpeg" {
         str module = "luce_jpeg.jpeg"
+    }
+
+    def dependency "luce-std" {
+        str owner = "dymokomi"
+        str version = "^0.1.0"
+        str path = "../luce-std"
     }
 }
