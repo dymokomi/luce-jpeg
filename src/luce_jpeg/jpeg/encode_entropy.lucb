@@ -1,0 +1,303 @@
+#==============================================================================================
+#
+#   jpeg/encode_entropy - Huffman coding of quantized blocks
+#
+#   DESCRIPTION:
+#       Blocks arrive quantized in zigzag order. A block's nonzero coefficients are found
+#       as a 64-bit mask, four at a time, and walked by their set bits, so zero runs cost
+#       nothing. Each band codes into its own unstuffed stream of 32-bit words; the
+#       bands are then joined in order into the file with 0xFF stuffing, restart markers
+#       and the first MCU of each band, whose DC predictions need the band before.
+#
+#       Tables are the standard ones of ITU T.81 Annex K, or with `optimize` ones fitted
+#       to the picture's own symbol counts (libjpeg's jpeg_gen_optimal_table).
+#
+#==============================================================================================
+
+let std_dc_luma_counts: u8[16] = [0, 1, 5, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+let std_dc_luma_values: u8[12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+let std_ac_luma_counts: u8[16] = [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125]
+let std_ac_luma_values: u8[162] = [1, 2, 3, 0, 4, 17, 5, 18, 33, 49, 65, 6, 19, 81, 97, 7, 34, 113, 20, 50, 129, 145, 161, 8, 35, 66, 177, 193, 21, 82, 209, 240, 36, 51, 98, 114, 130, 9, 10, 22, 23, 24, 25, 26, 37, 38, 39, 40, 41, 42, 52, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 225, 226, 227, 228, 229, 230, 231, 232, 233, 234, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250]
+let std_dc_chroma_counts: u8[16] = [0, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]
+let std_dc_chroma_values: u8[12] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+let std_ac_chroma_counts: u8[16] = [0, 2, 1, 2, 4, 4, 3, 4, 7, 5, 4, 4, 0, 1, 2, 119]
+let std_ac_chroma_values: u8[162] = [0, 1, 2, 3, 17, 4, 5, 33, 49, 6, 18, 65, 81, 7, 97, 113, 19, 34, 50, 129, 8, 20, 66, 145, 161, 177, 193, 9, 35, 51, 82, 240, 21, 98, 114, 209, 10, 22, 36, 52, 225, 37, 241, 23, 24, 25, 26, 38, 39, 40, 41, 42, 53, 54, 55, 56, 57, 58, 67, 68, 69, 70, 71, 72, 73, 74, 83, 84, 85, 86, 87, 88, 89, 90, 99, 100, 101, 102, 103, 104, 105, 106, 115, 116, 117, 118, 119, 120, 121, 122, 130, 131, 132, 133, 134, 135, 136, 137, 138, 146, 147, 148, 149, 150, 151, 152, 153, 154, 162, 163, 164, 165, 166, 167, 168, 169, 170, 178, 179, 180, 181, 182, 183, 184, 185, 186, 194, 195, 196, 197, 198, 199, 200, 201, 202, 210, 211, 212, 213, 214, 215, 216, 217, 218, 226, 227, 228, 229, 230, 231, 232, 233, 234, 242, 243, 244, 245, 246, 247, 248, 249, 250]
+
+## One Huffman table for writing: counts of codes by length and symbols (for the
+## DHT segment), and each symbol's code and length.
+struct CodeTable:
+    var counts: u8[16]
+    var values: u8[256]
+    var count: usize
+    var code: u32[256]
+    var size: u8[256]
+
+    ## A table from code counts by length and symbols in code order.
+    static func make(counts: const u8[], values: const u8[]) -> CodeTable:
+        var table = CodeTable()
+        var code: u32 = 0
+        var k: usize = 0
+        for length in 0..<(usize)16:
+            table.counts[length] = counts[length]
+            for i in 0..<(usize)counts[length]:
+                let symbol = (usize)values[k]
+                table.values[k] = values[k]
+                table.code[symbol] = code
+                table.size[symbol] = (u8)(length + 1)
+                code += 1
+                k += 1
+            code <<= 1
+        table.count = k
+        return table
+
+## Symbol counts for fitting tables: DC and AC, luma at 0 and chroma at 257.
+struct Counts:
+    var dc: u32[514]
+    var ac: u32[514]
+
+## A table fitted to `frequency` (257 entries, the last reserved): libjpeg's
+## jpeg_gen_optimal_table, code lengths limited to 16 bits and the all-ones code
+## left unused.
+func optimal_table(frequency: const u32[]) -> CodeTable:
+    var freq: i64[257]
+    for i in 0..<(usize)256:
+        freq[i] = (i64)frequency[i]
+    freq[256] = 1
+    var codesize: i32[257]
+    var others: i32[257]
+    for i in 0..<(usize)257:
+        others[i] = -1
+    while true:
+        # The two least frequent trees (the larger symbol on ties) merge.
+        var c1: i32 = -1
+        var v: i64 = 1000000000000
+        for i in 0..<(usize)257:
+            if freq[i] != 0 and freq[i] <= v:
+                v = freq[i]
+                c1 = (i32)i
+        var c2: i32 = -1
+        v = 1000000000000
+        for i in 0..<(usize)257:
+            if freq[i] != 0 and freq[i] <= v and (i32)i != c1:
+                v = freq[i]
+                c2 = (i32)i
+        if c2 < 0:
+            break
+        freq[(usize)c1] += freq[(usize)c2]
+        freq[(usize)c2] = 0
+        codesize[(usize)c1] += 1
+        while others[(usize)c1] >= 0:
+            c1 = others[(usize)c1]
+            codesize[(usize)c1] += 1
+        others[(usize)c1] = c2
+        codesize[(usize)c2] += 1
+        while others[(usize)c2] >= 0:
+            c2 = others[(usize)c2]
+            codesize[(usize)c2] += 1
+    var bits: i32[33]
+    for i in 0..<(usize)257:
+        if codesize[i] != 0:
+            bits[(usize)codesize[i]] += 1
+    # Lengths over 16 move up the tree, as Annex K.3 describes.
+    var i: usize = 32
+    while i > 16:
+        while bits[i] > 0:
+            var j = i - 2
+            while bits[j] == 0:
+                j -= 1
+            bits[i] -= 2
+            bits[i - 1] += 1
+            bits[j + 1] += 2
+            bits[j] -= 1
+        i -= 1
+    # Drop the reserved symbol's code, the longest.
+    while bits[i] == 0:
+        i -= 1
+    bits[i] -= 1
+    var counts: u8[16]
+    for length in 1..<(usize)17:
+        counts[length - 1] = (u8)bits[length]
+    var values: u8[256]
+    var k: usize = 0
+    for length in 1..<(i32)33:
+        for symbol in 0..<(usize)256:
+            if codesize[symbol] == length:
+                values[k] = (u8)symbol
+                k += 1
+    return CodeTable.make(counts, values[..<k])
+
+## The number of bits of a magnitude below 2048.
+func magnitude_bits() -> u8[2048]:
+    var table: u8[2048]
+    for v in 1..<(usize)2048:
+        var n: u8 = 0
+        var x = v
+        while x != 0:
+            x >>= 1
+            n += 1
+        table[v] = n
+    return table
+
+## An unstuffed bit stream in 32-bit words, most significant first, growing as it
+## fills; `failed` when growing failed.
+struct BitBuffer:
+    var words: u32[]
+    var used: usize
+    var acc: u64
+    var bits: u32
+    var failed: bool
+
+    ## Room for `count` more words.
+    mutating func ensure(count: usize) -> bool:
+        if self.used + count <= self.words.length:
+            return true
+        var capacity = self.words.length * 2
+        if capacity < self.used + count:
+            capacity = self.used + count + 1024
+        let grown = alloc u32[capacity] in memory.heap catch:
+            self.failed = true
+            return false
+        memory.copy(grown, self.words, self.used)
+        if self.words.length > 0:
+            free(self.words) in memory.heap
+        self.words = grown
+        return true
+
+    mutating func reset():
+        self.used = 0
+        self.acc = 0
+        self.bits = 0
+        self.failed = false
+
+    mutating func close():
+        if self.words.length > 0:
+            free(self.words) in memory.heap
+        self = BitBuffer()
+
+## Everything block coding reads.
+struct Coding:
+    ## DC and AC tables for luma (0) and chroma (1).
+    var dc: CodeTable[2]
+    var ac: CodeTable[2]
+    var sizes: u8[2048]
+
+## Code one zigzag-ordered block after `predictor` into `out`, which has room for
+## 64 symbols (at most 54 words).
+func code_block(out: BitBuffer*, block: const i16*, predictor: i32, dc: const CodeTable*, ac: const CodeTable*, sizes: const u8*):
+    var acc = out.acc
+    var bits = out.bits
+    var used = out.used
+    let words = out.words.data
+    # DC: the size category, then the difference's bits.
+    let diff = (i32)block[0] - predictor
+    let magnitude = diff if diff >= 0 else -diff
+    let dc_size = (u32)sizes[(usize)magnitude]
+    let dc_bits = (u64)(diff if diff >= 0 else diff - 1) & (((u64)1 << (u64)dc_size) - 1)
+    let dc_length = (u32)dc.size[(usize)dc_size]
+    acc = (acc << (u64)(dc_length + dc_size)) | ((u64)dc.code[(usize)dc_size] << (u64)dc_size) | dc_bits
+    bits += dc_length + dc_size
+    if bits >= 32:
+        bits -= 32
+        words[used] = (u32)(acc >> (u64)bits)
+        used += 1
+    # AC: walk the nonzero coefficients; the gaps are the runs.
+    let quads = (const u64*)block
+    var mask: u64 = 0
+    for q in 0..<(usize)16:
+        mask |= (u64)nonzero4(quads[q]) << (u64)(q * 4)
+    mask &= ~(u64)1
+    var last: usize = 0
+    while mask != 0:
+        let k = lowest64(mask)
+        mask &= mask - 1
+        var run = k - last - 1
+        last = k
+        while run > 15:
+            acc = (acc << (u64)ac.size[240]) | (u64)ac.code[240]
+            bits += (u32)ac.size[240]
+            if bits >= 32:
+                bits -= 32
+                words[used] = (u32)(acc >> (u64)bits)
+                used += 1
+            run -= 16
+        let value = (i32)block[k]
+        let size = (u32)sizes[(usize)(value if value >= 0 else -value)]
+        let symbol = (run << 4) | (usize)size
+        let length = (u32)ac.size[symbol]
+        let extra = (u64)(value if value >= 0 else value - 1) & (((u64)1 << (u64)size) - 1)
+        acc = (acc << (u64)(length + size)) | ((u64)ac.code[symbol] << (u64)size) | extra
+        bits += length + size
+        if bits >= 32:
+            bits -= 32
+            words[used] = (u32)(acc >> (u64)bits)
+            used += 1
+    if last != 63:
+        acc = (acc << (u64)ac.size[0]) | (u64)ac.code[0]
+        bits += (u32)ac.size[0]
+        if bits >= 32:
+            bits -= 32
+            words[used] = (u32)(acc >> (u64)bits)
+            used += 1
+    out.acc = acc
+    out.bits = bits
+    out.used = used
+
+## Count one block's symbols after `predictor` into `dc` and `ac`.
+func count_block(block: const i16*, predictor: i32, dc: u32*, ac: u32*, sizes: const u8*):
+    let diff = (i32)block[0] - predictor
+    dc[(usize)sizes[(usize)(diff if diff >= 0 else -diff)]] += 1
+    let quads = (const u64*)block
+    var mask: u64 = 0
+    for q in 0..<(usize)16:
+        mask |= (u64)nonzero4(quads[q]) << (u64)(q * 4)
+    mask &= ~(u64)1
+    var last: usize = 0
+    while mask != 0:
+        let k = lowest64(mask)
+        mask &= mask - 1
+        var run = k - last - 1
+        last = k
+        while run > 15:
+            ac[240] += 1
+            run -= 16
+        let value = (i32)block[k]
+        ac[(run << 4) | (usize)sizes[(usize)(value if value >= 0 else -value)]] += 1
+    if last != 63:
+        ac[0] += 1
+
+## The file writer: bits into bytes of `out`, with a 0 after every 0xFF.
+struct Stuffer:
+    var out: Buffer*
+    var acc: u64
+    var bits: u32
+
+    ## `count` bits (at most 32) of `value`; the caller has reserved room.
+    mutating func put(value: u64, count: u32):
+        var acc = (self.acc << (u64)count) | value
+        var bits = self.bits + count
+        let data = self.out.data.data
+        var used = self.out.used
+        while bits >= 8:
+            bits -= 8
+            let byte = (u8)(acc >> (u64)bits)
+            data[used] = byte
+            used += 1
+            if byte == 255:
+                data[used] = 0
+                used += 1
+        self.out.used = used
+        self.acc = acc
+        self.bits = bits
+
+    ## Pad to a byte with ones.
+    mutating func align():
+        if self.bits > 0:
+            self.put(((u64)1 << (u64)(8 - self.bits)) - 1, 8 - self.bits)
+
+    ## A band's stream: its words, then its unfinished last word.
+    mutating func append(band: const BitBuffer*):
+        let words = band.words.data
+        for i in 0..<band.used:
+            self.put((u64)words[i], 32)
+        if band.bits > 0:
+            self.put(band.acc & (((u64)1 << (u64)band.bits) - 1), band.bits)

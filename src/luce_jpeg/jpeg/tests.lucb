@@ -182,3 +182,121 @@ test "bad requests and bad data fail cleanly":
         refused = failure.code == corrupt
         recover Info(width = 0, height = 0, components = 0, progressive = false))
     assert(refused)
+
+## A smooth RGBA test picture with an edge, for the encoder.
+func rgba_picture(pixels: u8[], width: usize, height: usize):
+    for y in 0..<height:
+        for x in 0..<width:
+            let at = (y * width + x) * 4
+            let edge: usize = 70 if x * 3 > width * 2 else 0
+            pixels[at] = (u8)((x * 255 // width + edge) % 256)
+            pixels[at + 1] = (u8)(y * 255 // height)
+            pixels[at + 2] = (u8)((x + y) * 2 % 256)
+            pixels[at + 3] = 255
+
+## Mean and largest absolute difference between RGBA `source` and RGB `decoded`.
+func compare_pixels(source: const u8[], decoded: const u8[], count: usize) -> (i64, i64):
+    var total: i64 = 0
+    var worst: i64 = 0
+    for i in 0..<count:
+        for c in 0..<(usize)3:
+            let d = (i64)source[i * 4 + c] - (i64)decoded[i * 3 + c]
+            let magnitude = d if d >= 0 else -d
+            total += magnitude
+            worst = magnitude if magnitude > worst else worst
+    return (total // (i64)(count * 3), worst)
+
+test "the encoding APIs agree byte for byte":
+    var rgba: u8[3108]
+    rgba_picture(rgba, 37, 21)
+    var rgb: u8[2331]
+    for i in 0..<(usize)777:
+        rgb[i * 3] = rgba[i * 4]
+        rgb[i * 3 + 1] = rgba[i * 4 + 1]
+        rgb[i * 3 + 2] = rgba[i * 4 + 2]
+    var whole = Buffer()
+    defer whole.close()
+    try encode_rgba8(rgba, 37, 21, &whole)
+    var three = Buffer()
+    defer three.close()
+    try encode_rgb8(rgb, 37, 21, &three)
+    var streamed = Buffer()
+    defer streamed.close()
+    var encoder = try Encoder.begin(37, 21, .rgba, &streamed)
+    defer encoder.close()
+    var y: usize = 0
+    while y < 21:
+        let rows: usize = 5 if y + 5 <= 21 else 21 - y
+        try encoder.write_rows(rgba[y * 148..<(y + rows) * 148], rows)
+        y += rows
+    try encoder.finish()
+    assert(whole.used == three.used and whole.used == streamed.used)
+    for i in 0..<whole.used:
+        assert(whole.data[i] == three.data[i] and whole.data[i] == streamed.data[i])
+
+test "every encoder option decodes close to the source":
+    var rgba: u8[6000]
+    rgba_picture(rgba, 50, 30)
+    let samplings: Subsampling[3] = [.s444, .s422, .s420]
+    for sampling in samplings:
+        for variant in 0..<(usize)4:
+            var out = Buffer()
+            defer out.close()
+            try encode_rgba8(rgba, 50, 30, &out, EncodeOptions(quality = 95, subsampling = sampling, restart = variant % 2 == 1, optimize = variant >= 2))
+            let found = try info(out.view())
+            assert(found.width == 50 and found.height == 30 and found.components == 3)
+            var decoded: u8[4500]
+            try decode_rgb8(out.view(), decoded)
+            let (mean, worst) = compare_pixels(rgba, decoded, 1500)
+            # Halved chroma blurs the hard colour edge; elsewhere the error is small.
+            if sampling == .s444:
+                assert(mean <= 1 and worst <= 12)
+            else:
+                assert(mean <= 4 and worst <= 90)
+
+test "gray and tiny pictures encode":
+    var gray: u8[153]
+    for i in 0..<gray.length:
+        gray[i] = (u8)(i * 5 % 256)
+    var out = Buffer()
+    defer out.close()
+    try encode_gray8(gray, 17, 9, &out, EncodeOptions(optimize = true))
+    let found = try info(out.view())
+    assert(found.components == 1 and found.width == 17 and found.height == 9)
+    var decoded: u8[459]
+    try decode_rgb8(out.view(), decoded)
+    var one = Buffer()
+    defer one.close()
+    let pixel: u8[4] = [200, 30, 90, 255]
+    try encode_rgba8(pixel, 1, 1, &one, EncodeOptions(quality = 100))
+    var back: u8[3]
+    try decode_rgb8(one.view(), back)
+    assert(back[0] >= 196 and back[0] <= 204 and back[1] >= 26 and back[1] <= 34 and back[2] >= 86 and back[2] <= 94)
+
+test "the encoder refuses bad requests":
+    var out = Buffer()
+    defer out.close()
+    var pixels: u8[64]
+    var refused = false
+    encode_rgba8(pixels, 4, 4, &out, EncodeOptions(quality = 0)) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    refused = false
+    encode_rgba8(pixels[..<60], 4, 4, &out) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    var encoder = try Encoder.begin(4, 4, .rgba, &out)
+    defer encoder.close()
+    try encoder.write_rows(pixels[..<32], 2)
+    refused = false
+    encoder.finish() catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    refused = false
+    encoder.write_rows(pixels, 4) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)

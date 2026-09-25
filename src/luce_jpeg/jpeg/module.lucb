@@ -17,6 +17,9 @@
 #       samples (`probe` then `decode`). Every route produces the same sample values,
 #       bit for bit those of the plain float decoder this one replaced.
 #
+#       Encoding takes 8-bit RGBA, RGB or gray rows at once (`encode_rgba8`...) or
+#       pushed in bands through an `Encoder`, and runs on every processor too.
+#
 #       Fragments, in ORDER:
 #
 #       module.lucb       the public API
@@ -27,7 +30,9 @@
 #       idct.lucb         the exact separable IDCT, full size and DCT-scaled
 #       color.lucb        upsampling and colour conversion of one output row
 #       render.lucb       the worker crew, render geometry, the band schedule, targets
-#       encode.lucb       the baseline encoder
+#       encode.lucb       the encoder's API, band orchestration and file header
+#       encode_transform.lucb  colour conversion, downsampling, the quantized AAN DCT
+#       encode_entropy.lucb    Huffman tables, optimal tables, bit streams and joining
 #       tests.lucb        the module's tests
 #
 #==============================================================================================

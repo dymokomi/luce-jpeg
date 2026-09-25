@@ -1,0 +1,84 @@
+## Encodes the decoded pixels of a JPEG and times it:
+## `encode <in.jpg> <out.jpg> [repeats] [raster|rgba|rgb|gray|stream] [quality]
+## [444|422|420] [flags] [threads]`, flags a mix of `r` (restart markers) and `o`
+## (optimized tables), or `-`. `stream` pushes RGBA rows 100 at a time through an
+## Encoder. The last encoding is written out.
+import files
+import c
+import time
+import memory
+import strings
+import jpeg
+from raster import Raster
+from binary import Buffer
+
+func number(arguments: str[], index: usize, fallback: u64) -> u64:
+    if arguments.length <= index:
+        return fallback
+    return strings.parse_u64(arguments[index]) else fallback
+
+pub func main(arguments: str[]) -> i32!:
+    let encoded = try files.read((c.str)arguments[1])
+    let repeats = (usize)number(arguments, 3, 1)
+    let mode = arguments[4] if arguments.length > 4 else "rgba"
+    let quality = (i64)number(arguments, 5, 90)
+    let sampling = arguments[6] if arguments.length > 6 else "420"
+    let flags = arguments[7] if arguments.length > 7 else "-"
+    let threads = (usize)number(arguments, 8, 0)
+    let info = try jpeg.info(encoded)
+    let width = info.width
+    let height = info.height
+    var options = jpeg.EncodeOptions(quality = quality, threads = threads)
+    options.subsampling = .s444 if sampling == "444" else .s422 if sampling == "422" else .s420
+    options.restart = strings.contains(flags, "r")
+    options.optimize = strings.contains(flags, "o")
+    # The picture: RGBA from the decoder, then RGB, gray or a Raster from that.
+    let rgba = try alloc u8[width * height * 4] in memory.heap
+    defer free(rgba) in memory.heap
+    try jpeg.decode_rgba8(encoded, rgba)
+    let pixel: usize = 3 if mode == "rgb" or mode == "raster" else 1 if mode == "gray" else 4
+    let pixels = try alloc u8[width * height * pixel] in memory.heap
+    defer free(pixels) in memory.heap
+    for i in 0..<width * height:
+        if pixel == 1:
+            pixels[i] = rgba[i * 4 + 1]
+        else:
+            for k in 0..<pixel:
+                pixels[i * pixel + k] = rgba[i * 4 + k]
+    var raster = Raster()
+    defer raster.close()
+    if mode == "raster":
+        raster.width = width
+        raster.height = height
+        try raster.standard(3, .uint8)
+        try raster.allocate()
+        for i in 0..<pixels.length:
+            raster.pixels[i] = (f64)pixels[i]
+    var best: u64 = 0
+    var out = Buffer()
+    defer out.close()
+    for r in 0..<repeats:
+        out.used = 0
+        let start = time.now()
+        if mode == "raster":
+            try jpeg.encode(&raster, &out, quality = quality)
+        elif mode == "stream":
+            var encoder = try jpeg.Encoder.begin(width, height, .rgba, &out, options)
+            defer encoder.close()
+            var y: usize = 0
+            while y < height:
+                let rows: usize = 100 if y + 100 <= height else height - y
+                try encoder.write_rows(pixels[y * width * 4..<(y + rows) * width * 4], rows)
+                y += rows
+            try encoder.finish()
+        elif mode == "rgb":
+            try jpeg.encode_rgb8(pixels, width, height, &out, options)
+        elif mode == "gray":
+            try jpeg.encode_gray8(pixels, width, height, &out, options)
+        else:
+            try jpeg.encode_rgba8(pixels, width, height, &out, options)
+        let spent = time.since(start)
+        best = spent if r == 0 or spent < best else best
+    try files.write((c.str)arguments[2], out.view())
+    print(f"{width}x{height} {mode} q{quality} {sampling} {flags}: best {best // 1000000}.{(best // 100000) % 10} ms, {out.used} bytes")
+    return 0

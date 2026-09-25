@@ -3,165 +3,407 @@
 #   jpeg/encode - The baseline encoder
 #
 #   DESCRIPTION:
-#       Baseline 4:4:4 JPEG from 8-bit grayscale or RGB samples with the standard
-#       luminance quantization table scaled by quality and one fixed Huffman table.
+#       Baseline JPEG from 8-bit gray, RGB or RGBA rows (alpha is ignored), 4:4:4, 4:2:2
+#       or 4:2:0, with the Annex K quantization tables scaled by quality. Rows arrive
+#       all at once (`encode_rgba8` and friends) or in any number of pushes through an
+#       `Encoder`, which holds only a group of MCU rows (a few per thread) at a time.
+#
+#       Each group's MCU rows transform and Huffman-code on every processor into
+#       separate bit streams, which the calling thread then joins into the file. With
+#       `restart` a restart marker follows every MCU row, so decoders (this one too)
+#       can split the entropy decoding. With `optimize` the Huffman tables are fitted
+#       to the picture in a second pass, which keeps every block until `finish`.
 #
 #==============================================================================================
 
-struct BitWriter:
-    var out: Buffer*
-    var value: u32
-    var count: u32
+## Chroma resolution: full, half across, or half across and down.
+pub enum Subsampling:
+    s444
+    s422
+    s420
 
-    mutating func put(value: u32, count: u32) -> !:
-        var n = count
-        while n > 0:
-            n -= 1
-            self.value = (self.value << 1) | ((value >> n) & 1)
-            self.count += 1
-            if self.count == 8:
-                try self.out.byte((u8)self.value)
-                if (u8)self.value == 255:
-                    try self.out.byte(0)
-                self.count = 0
-                self.value = 0
+## Input pixels: bytes a pixel and their order.
+pub enum Input:
+    rgba
+    rgb
+    gray
 
-    mutating func coefficient(value: i32, dc: bool, run: u32 = 0) -> !:
-        var magnitude = (u32)(value if value >= 0 else -value)
-        var count: u32 = 0
-        while magnitude != 0:
-            magnitude >>= 1
-            count += 1
-        if dc:
-            if count > 11:
-                error(invalid, "JPEG DC coefficient out of range")
-            try self.put(count, 4)
-        else:
-            if count > 10 or count == 0:
-                error(invalid, "JPEG AC coefficient out of range")
-            try self.put(2 + run * 10 + count - 1, 8)
-        if count > 0:
-            try self.put((u32)(value if value >= 0 else value - 1) & (((u32)1 << count) - 1), count)
+## How an encode runs.
+pub struct EncodeOptions:
+    ## 1..100, as libjpeg's quality.
+    pub var quality: i64 = 90
+    ## Ignored for gray input.
+    pub var subsampling: Subsampling = .s420
+    ## A restart marker after every MCU row.
+    pub var restart: bool = false
+    ## Huffman tables fitted to the picture: a few percent smaller, and every block
+    ## is kept in memory until `finish`.
+    pub var optimize: bool = false
+    ## Worker threads, counting the caller's; 0 uses every processor.
+    pub var threads: usize = 0
+
+## Encode `width` x `height` RGBA pixels (row after row) as a JPEG appended to `output`.
+pub func encode_rgba8(pixels: const u8[], width: usize, height: usize, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:
+    try encode_pixels(pixels, width, height, .rgba, output, options)
+
+## Encode RGB pixels, three bytes each.
+pub func encode_rgb8(pixels: const u8[], width: usize, height: usize, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:
+    try encode_pixels(pixels, width, height, .rgb, output, options)
+
+## Encode gray pixels, one byte each, as a one-component JPEG.
+pub func encode_gray8(pixels: const u8[], width: usize, height: usize, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:
+    try encode_pixels(pixels, width, height, .gray, output, options)
+
+func encode_pixels(pixels: const u8[], width: usize, height: usize, input: Input, output: Buffer*, options: EncodeOptions) -> !:
+    var encoder = try Encoder.begin(width, height, input, output, options)
+    defer encoder.close()
+    try encoder.write_rows(pixels, height)
+    try encoder.finish()
+
+## Encode a Raster's gray or RGB uint8 samples at `quality`, 4:4:4, as before.
+pub func encode(image: const Raster*, output: Buffer*, quality: i64 = 90) -> !:
+    let nc = image.channels.length
+    if nc != 1 and nc != 3:
+        error(unsupported, "JPEG requires grayscale or RGB; convert alpha explicitly")
+    for c in image.channels:
+        if c.kind != .uint8:
+            error(unsupported, "JPEG requires uint8 samples")
+    if image.pixels.length != image.width * image.height * nc:
+        error(invalid, "JPEG raster pixels are not allocated")
+    var encoder = try Encoder.begin(image.width, image.height, .gray if nc == 1 else .rgb, output, EncodeOptions(quality = quality, subsampling = .s444))
+    defer encoder.close()
+    # Samples to bytes a few rows at a time, rounded to the nearest.
+    let chunk: usize = 64
+    let row_bytes = image.width * nc
+    let bytes = try alloc u8[chunk * row_bytes] in memory.heap
+    defer free(bytes) in memory.heap
+    var y: usize = 0
+    while y < image.height:
+        let rows = chunk if y + chunk <= image.height else image.height - y
+        let samples = image.pixels[y * row_bytes..<(y + rows) * row_bytes]
+        for i in 0..<samples.length:
+            let value = samples[i]
+            if not (value >= 0.0 and value <= 255.0):
+                error(invalid, "JPEG sample out of range")
+            bytes[i] = floor8(value + 0.5)
+        try encoder.write_rows(bytes[..<rows * row_bytes], rows)
+        y += rows
+    try encoder.finish()
+
+## One MCU row's work: its blocks, its coded stream (MCU 1 on, or all of it when
+## `whole`), and each component's last DC.
+struct Band:
+    var blocks: i16[]
+    var stream: BitBuffer
+    var last: i32[3]
+    var whole: bool
+    var counts: Counts
+
+## A JPEG being written row by row: `begin`, `write_rows` as often as needed, then
+## `finish`, and `close` in any case.
+pub struct Encoder:
+    var frame: EncodeFrame
+    var coding: Coding
+    var output: Buffer*
+    var threads: usize
+    ## MCU rows a group, and the group's row buffer and the rows in it.
+    var group: usize
+    var rows: u8[]
+    var buffered: usize
+    ## Rows received, and MCU rows transformed.
+    var received: usize
+    var next_band: usize
+    ## The group's bands, or with `optimize` every band.
+    var bands: Band[]
+    var first: BitBuffer
+    var writer: Stuffer
+    var predictors: i32[3]
+    var finished: bool
+
+    ## Start a `width` x `height` JPEG of `input` pixels at the end of `output`.
+    pub static func begin(width: usize, height: usize, input: Input, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
+        if width == 0 or height == 0 or width > 65535 or height > 65535 or options.quality < 1 or options.quality > 100:
+            error(invalid, "JPEG dimensions or quality out of range")
+        let pixel: usize = 4 if input == .rgba else 3 if input == .rgb else 1
+        var encoder = Encoder(frame = EncodeFrame.make(width, height, pixel, options.subsampling, options.quality, options.restart, options.optimize), output = output, threads = thread_count(options.threads, width * height), writer = Stuffer(out = output, acc = 0, bits = 0))
+        let f = &encoder.frame
+        encoder.group = encoder.threads * 2 if encoder.threads * 2 < f.mcuy else f.mcuy
+        encoder.coding.sizes = magnitude_bits()
+        encoder.coding.dc[0] = CodeTable.make(std_dc_luma_counts, std_dc_luma_values)
+        encoder.coding.ac[0] = CodeTable.make(std_ac_luma_counts, std_ac_luma_values)
+        encoder.coding.dc[1] = CodeTable.make(std_dc_chroma_counts, std_dc_chroma_values)
+        encoder.coding.ac[1] = CodeTable.make(std_ac_chroma_counts, std_ac_chroma_values)
+        encoder.bands = try new Band[f.mcuy if f.optimize else encoder.group] in memory.heap
+        errdefer encoder.close()
+        if not f.optimize:
+            try write_header(&encoder)
+        return encoder
+
+    ## Push `count` rows of pixels, tightly packed.
+    pub mutating func write_rows(pixels: const u8[], count: usize) -> !:
+        let f = &self.frame
+        let row_bytes = f.width * f.pixel
+        if self.finished or self.received + count > f.height:
+            error(invalid, "more JPEG rows than the picture has")
+        if pixels.length < count * row_bytes:
+            error(invalid, "JPEG rows are shorter than the width")
+        let group_rows = self.group * f.band_rows
+        var taken: usize = 0
+        while taken < count:
+            if self.buffered == 0:
+                # Whole groups, or everything left of the picture, straight from the
+                # caller's rows.
+                let left = count - taken
+                var bands: usize = 0
+                if self.received + left == f.height:
+                    bands = f.mcuy - self.next_band
+                elif left >= group_rows:
+                    bands = left // group_rows * self.group
+                if bands > 0:
+                    let source = Source(data = pixels.data + taken * row_bytes, stride = row_bytes, first_row = self.received)
+                    try self.encode_bands(&source, bands)
+                    let used = left if self.received + left == f.height else bands * f.band_rows
+                    taken += used
+                    self.received += used
+                    continue
+            if self.rows.length == 0:
+                self.rows = try alloc u8[group_rows * row_bytes] in memory.heap
+            let rows = group_rows - self.buffered if group_rows - self.buffered < count - taken else count - taken
+            memory.copy(self.rows[self.buffered * row_bytes..], pixels[taken * row_bytes..], rows * row_bytes)
+            self.buffered += rows
+            self.received += rows
+            taken += rows
+            if self.buffered == group_rows or self.received == f.height:
+                let source = Source(data = self.rows.data, stride = row_bytes, first_row = self.received - self.buffered)
+                let bands = self.group if self.received < f.height else f.mcuy - self.next_band
+                try self.encode_bands(&source, bands)
+                self.buffered = 0
+
+    ## Complete the file once every row is in.
+    pub mutating func finish() -> !:
+        let f = &self.frame
+        if self.finished:
+            return
+        if self.received != f.height:
+            error(invalid, "JPEG rows missing at finish")
+        if f.optimize:
+            try self.fit_tables()
+            try write_header(&self)
+            var band: usize = 0
+            while band < f.mcuy:
+                let count = self.group if band + self.group <= f.mcuy else f.mcuy - band
+                try self.code_group(band, count)
+                band += count
+        try self.output.reserve(8)
+        self.writer.align()
+        try self.output.put(b"\xff\xd9")
+        self.finished = true
+
+    pub mutating func close():
+        for i in 0..<self.bands.length:
+            if self.bands[i].blocks.length > 0:
+                free(self.bands[i].blocks) in memory.heap
+            self.bands[i].stream.close()
+        if self.bands.length > 0:
+            free(self.bands) in memory.heap
+        if self.rows.length > 0:
+            free(self.rows) in memory.heap
+        self.first.close()
+        var empty: Band[]
+        self.bands = empty
+        var none_rows: u8[]
+        self.rows = none_rows
+
+    ## Transform `count` MCU rows from `source` and, unless optimizing, code them.
+    mutating func encode_bands(source: const Source*, count: usize) -> !:
+        var done: usize = 0
+        while done < count:
+            let n = self.group if done + self.group <= count else count - done
+            var job = BandJob(encoder = &self, source = source, first_band = self.next_band)
+            try run_tasks(band_task, (void*)&job, n, self.threads, 0, 0, transform_bytes(&self.frame))
+            if job.failed.load() != 0:
+                error(memory.exhausted, "JPEG encoder buffers could not grow")
+            if not self.frame.optimize:
+                for i in 0..<n:
+                    try self.join(&self.bands[i], self.next_band + i)
+            self.next_band += n
+            done += n
+
+    ## Append band `index`'s stream to the file: its restart marker, its first MCU
+    ## (unless the stream has it) and the rest.
+    mutating func join(band: Band*, index: usize) -> !:
+        let f = &self.frame
+        try self.output.reserve(band.stream.used * 8 + f.mcu_blocks * 64 * 8 + 64)
+        if f.restart and index > 0:
+            self.writer.align()
+            self.output.data[self.output.used] = 255
+            self.output.data[self.output.used + 1] = (u8)(208 + (index - 1) % 8)
+            self.output.used += 2
+            self.predictors = [0, 0, 0]
+        if not band.whole:
+            self.first.reset()
+            if not self.first.ensure(f.mcu_blocks * 54 + 2):
+                error(memory.exhausted, "JPEG encoder buffers could not grow")
+            code_mcu(&self.frame, &self.coding, band.blocks.data, &self.predictors[0], &self.first)
+            self.writer.append(&self.first)
+        self.writer.append(&band.stream)
+        self.predictors = band.last
+
+    ## Count every band's symbols and fit the four tables to them.
+    mutating func fit_tables() -> !:
+        let f = &self.frame
+        var job = BandJob(encoder = &self, first_band = 0, counting = true)
+        try run_tasks(band_task, (void*)&job, f.mcuy, self.threads)
+        var total = Counts()
+        for b in 0..<f.mcuy:
+            for i in 0..<(usize)514:
+                total.dc[i] += self.bands[b].counts.dc[i]
+                total.ac[i] += self.bands[b].counts.ac[i]
+        for t in 0..<(usize)(1 if f.count == 1 else 2):
+            self.coding.dc[t] = optimal_table(total.dc[t * 257..<t * 257 + 257])
+            self.coding.ac[t] = optimal_table(total.ac[t * 257..<t * 257 + 257])
+
+    ## Code kept bands `first..<first + count` whole and join them.
+    mutating func code_group(first: usize, count: usize) -> !:
+        var job = BandJob(encoder = &self, first_band = first, coding = true)
+        try run_tasks(band_task, (void*)&job, count, self.threads)
+        if job.failed.load() != 0:
+            error(memory.exhausted, "JPEG encoder buffers could not grow")
+        for i in 0..<count:
+            try self.join(&self.bands[first + i], first + i)
+            self.bands[first + i].stream.close()
+
+## One parallel step over bands: transform (and code, unless optimizing), count
+## symbols, or code kept bands whole.
+struct BandJob:
+    var encoder: Encoder*
+    var source: const Source*?
+    var first_band: usize
+    var counting: bool
+    var coding: bool
+    var failed: @u32
+
+func band_task(context: void*, index: usize, scratch: Scratch*):
+    let job = (BandJob*)context
+    let e = job.encoder
+    let f = &e.frame
+    let number = job.first_band + index
+    let band = &e.bands[number if f.optimize else index]
+    if job.counting or job.coding:
+        # Kept bands: predictors come from the band before, unless it restarted.
+        var predictors: i32[3] = [0, 0, 0]
+        if number > 0 and not f.restart:
+            predictors = e.bands[number - 1].last
+        if job.counting:
+            band.counts = Counts()
+            count_mcus(f, &e.coding, band.blocks.data, 0, f.mcux, &predictors[0], &band.counts)
+            return
+        band.stream.reset()
+        band.whole = true
+        if not code_mcus(f, &e.coding, band.blocks.data, 0, f.mcux, &predictors[0], &band.stream):
+            discard(job.failed.swap(1))
+        return
+    if band.blocks.length == 0:
+        band.blocks = alloc i16[f.band_blocks * 64] in memory.heap catch:
+            discard(job.failed.swap(1))
+            return
+    let source = job.source else return
+    transform_band(f, source, number, band.blocks.data, &band.last[0], scratch.bytes.data)
+    if f.optimize:
+        return
+    # MCU 1 on, predicted from MCU 0; the join codes MCU 0 once the band before is known.
+    var predictors: i32[3] = [0, 0, 0]
+    predictors[0] = (i32)band.blocks[(f.h * f.v - 1) * 64]
+    if f.count == 3:
+        predictors[1] = (i32)band.blocks[f.h * f.v * 64]
+        predictors[2] = (i32)band.blocks[(f.h * f.v + 1) * 64]
+    band.stream.reset()
+    band.whole = false
+    if not code_mcus(f, &e.coding, band.blocks.data, 1, f.mcux, &predictors[0], &band.stream):
+        discard(job.failed.swap(1))
+
+## Code MCUs `first..<last` of a band's blocks; false when the stream could not grow.
+func code_mcus(f: const EncodeFrame*, coding: const Coding*, blocks: const i16*, first: usize, last: usize, predictors: i32*, out: BitBuffer*) -> bool:
+    for mcu in first..<last:
+        if not out.ensure(f.mcu_blocks * 54 + 2):
+            return false
+        code_mcu(f, coding, blocks + mcu * f.mcu_blocks * 64, predictors, out)
+    return true
+
+## Code the MCU at `blocks`, updating the predictors.
+func code_mcu(f: const EncodeFrame*, coding: const Coding*, blocks: const i16*, predictors: i32*, out: BitBuffer*):
+    let luma = f.h * f.v
+    let sizes = &coding.sizes[0]
+    for i in 0..<luma:
+        code_block(out, blocks + i * 64, predictors[0], &coding.dc[0], &coding.ac[0], sizes)
+        predictors[0] = (i32)blocks[i * 64]
+    if f.count == 3:
+        for c in 1..<(usize)3:
+            let block = blocks + (luma + c - 1) * 64
+            code_block(out, block, predictors[c], &coding.dc[1], &coding.ac[1], sizes)
+            predictors[c] = (i32)block[0]
+
+func count_mcus(f: const EncodeFrame*, coding: const Coding*, blocks: const i16*, first: usize, last: usize, predictors: i32*, counts: Counts*):
+    let luma = f.h * f.v
+    let sizes = &coding.sizes[0]
+    for mcu in first..<last:
+        let at = blocks + mcu * f.mcu_blocks * 64
+        for i in 0..<luma:
+            count_block(at + i * 64, predictors[0], &counts.dc[0], &counts.ac[0], sizes)
+            predictors[0] = (i32)at[i * 64]
+        if f.count == 3:
+            for c in 1..<(usize)3:
+                let block = at + (luma + c - 1) * 64
+                count_block(block, predictors[c], &counts.dc[257], &counts.ac[257], sizes)
+                predictors[c] = (i32)block[0]
+
+## SOI through SOS: JFIF, quantization and Huffman tables, the frame, the restart
+## interval and the scan header.
+func write_header(e: Encoder*) -> !:
+    let f = &e.frame
+    let output = e.output
+    let tables: usize = 1 if f.count == 1 else 2
+    try output.put(b"\xff\xd8")
+    try emit_segment(output, 224, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0")
+    var data = Buffer()
+    defer data.close()
+    for t in 0..<tables:
+        try data.byte((u8)t)
+        for i in 0..<64:
+            try data.byte(f.quant[t * 64 + zigzag[i]])
+    try emit_segment(output, 219, data.view())
+    data.used = 0
+    try data.byte(8)
+    try data.uint((u64)f.height, 2, false)
+    try data.uint((u64)f.width, 2, false)
+    try data.byte((u8)f.count)
+    for c in 0..<f.count:
+        try data.byte((u8)c + 1)
+        try data.byte((u8)(f.h * 16 + f.v) if c == 0 else 17)
+        try data.byte(0 if c == 0 else 1)
+    try emit_segment(output, 192, data.view())
+    data.used = 0
+    for t in 0..<tables:
+        for class in 0..<(usize)2:
+            let table = &e.coding.dc[t] if class == 0 else &e.coding.ac[t]
+            try data.byte((u8)(class * 16 + t))
+            try data.put(table.counts)
+            try data.put(table.values[..<table.count])
+    try emit_segment(output, 196, data.view())
+    if f.restart:
+        data.used = 0
+        try data.uint((u64)f.mcux, 2, false)
+        try emit_segment(output, 221, data.view())
+    data.used = 0
+    try data.byte((u8)f.count)
+    for c in 0..<f.count:
+        try data.byte((u8)c + 1)
+        try data.byte(0 if c == 0 else 17)
+    try data.put(b"\0\x3f\0")
+    try emit_segment(output, 218, data.view())
 
 func emit_segment(output: Buffer*, code: u8, data: const u8[]) -> !:
     try output.byte(255)
     try output.byte(code)
     try output.uint((u64)data.length + 2, 2, false)
     try output.put(data)
-
-let quantization: u32[64] = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
-
-pub func encode(image: const Raster*, output: Buffer*, quality: i64 = 90) -> !:
-    let nc = image.channels.length
-    if nc != 1 and nc != 3:
-        error(unsupported, "JPEG requires grayscale or RGB; convert alpha explicitly")
-    if image.width > 65535 or image.height > 65535 or quality < 1 or quality > 100:
-        error(invalid, "JPEG dimensions or quality out of range")
-    for c in image.channels:
-        if c.kind != .uint8:
-            error(unsupported, "JPEG requires uint8 samples")
-    for value in image.pixels:
-        if not math.is_finite(value) or value < 0.0 or value > 255.0:
-            error(invalid, "JPEG sample out of range")
-    var quant: u32[64]
-    let scale = (u32)(5000 // quality if quality < 50 else 200 - quality * 2)
-    for i in 0..<64:
-        let q = (quantization[i] * scale + 50) // 100
-        quant[i] = 1 if q < 1 else 255 if q > 255 else q
-    try output.put(b"\xff\xd8")
-    try emit_segment(output, 224, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0")
-    var data = Buffer()
-    defer data.close()
-    try data.byte(0)
-    for i in 0..<64:
-        try data.byte((u8)quant[zigzag[i]])
-    try emit_segment(output, 219, data.view())
-    data.used = 0
-    try data.byte(8)
-    try data.uint((u64)image.height, 2, false)
-    try data.uint((u64)image.width, 2, false)
-    try data.byte((u8)nc)
-    for c in 0..<nc:
-        try data.byte((u8)c + 1)
-        try data.byte(17)
-        try data.byte(0)
-    try emit_segment(output, 192, data.view())
-    data.used = 0
-    try data.byte(0)
-    for i in 1..<17:
-        try data.byte(12 if i == 4 else 0)
-    for i in 0..<12:
-        try data.byte((u8)i)
-    try data.byte(16)
-    for i in 1..<17:
-        try data.byte(162 if i == 8 else 0)
-    try data.byte(0)
-    try data.byte(240)
-    for run in 0..<16:
-        for size in 1..<11:
-            try data.byte((u8)(run * 16 + size))
-    try emit_segment(output, 196, data.view())
-    data.used = 0
-    try data.byte((u8)nc)
-    for c in 0..<nc:
-        try data.byte((u8)c + 1)
-        try data.byte(0)
-    try data.put(b"\0\x3f\0")
-    try emit_segment(output, 218, data.view())
-    var bits = BitWriter(out = output)
-    var predictors: i32[3]
-    var cosine: f64[64]
-    for k in 0..<(usize)8:
-        for x in 0..<(usize)8:
-            cosine[k * 8 + x] = math.cos((f64)((2 * x + 1) * k) * 3.141592653589793 / 16.0) * (0.7071067811865476 if k == 0 else 1.0)
-    let across = (image.width + 7) // 8
-    let down = (image.height + 7) // 8
-    for by in 0..<down:
-        for bx in 0..<across:
-            for c in 0..<nc:
-                var samples: f64[64]
-                var temp: f64[64]
-                var coefficients: i32[64]
-                for y in 0..<(usize)8:
-                    for x in 0..<(usize)8:
-                        let sx = bx * 8 + x if bx * 8 + x < image.width else image.width - 1
-                        let sy = by * 8 + y if by * 8 + y < image.height else image.height - 1
-                        let index = (sy * image.width + sx) * nc
-                        let r = image.pixels[index]
-                        var value = r
-                        if nc == 3:
-                            let g = image.pixels[index + 1]
-                            let b = image.pixels[index + 2]
-                            value = 0.299 * r + 0.587 * g + 0.114 * b if c == 0 else -0.168736 * r - 0.331264 * g + 0.5 * b + 128.0 if c == 1 else 0.5 * r - 0.418688 * g - 0.081312 * b + 128.0
-                        samples[y * 8 + x] = value - 128.0
-                for y in 0..<(usize)8:
-                    for k in 0..<(usize)8:
-                        var sum: f64 = 0.0
-                        for x in 0..<(usize)8:
-                            sum += samples[y * 8 + x] * cosine[k * 8 + x]
-                        temp[y * 8 + k] = sum * 0.5
-                for k in 0..<(usize)8:
-                    for x in 0..<(usize)8:
-                        var sum: f64 = 0.0
-                        for y in 0..<(usize)8:
-                            sum += temp[y * 8 + x] * cosine[k * 8 + y]
-                        let value = sum * 0.5 / (f64)quant[k * 8 + x]
-                        coefficients[k * 8 + x] = (i32)(math.floor(value + 0.5) if value >= 0.0 else -math.floor(-value + 0.5))
-                try bits.coefficient(coefficients[0] - predictors[c], true)
-                predictors[c] = coefficients[0]
-                var run: u32 = 0
-                for i in 1..<(usize)64:
-                    let value = coefficients[zigzag[i]]
-                    if value == 0:
-                        run += 1
-                    else:
-                        while run >= 16:
-                            try bits.put(1, 8)
-                            run -= 16
-                        try bits.coefficient(value, false, run)
-                        run = 0
-                if run > 0:
-                    try bits.put(0, 8)
-    if bits.count > 0:
-        try bits.put(((u32)1 << (8 - bits.count)) - 1, 8 - bits.count)
-    try output.put(b"\xff\xd9")

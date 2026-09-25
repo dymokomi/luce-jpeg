@@ -19,11 +19,12 @@
 #==============================================================================================
 
 ## A worker's rows for one output row: component samples, an interpolated plane
-## row and 8-bit pixels.
+## row and 8-bit pixels; and bytes for the encoder's band planes.
 struct Scratch:
     var rows: f64[]
     var column: i32[]
     var pixels: u8[]
+    var bytes: u8[]
 
 struct Pool:
     var next: @usize
@@ -54,9 +55,9 @@ func drain(worker: Worker*):
         pool.task(pool.context, index, &worker.scratch)
 
 ## Start up to `threads - 1` threads on `task(context, i, scratch)` for i in
-## 0..<`count`; `crew_finish` makes the caller the last worker. `width` and
-## `column` size each worker's Scratch (0 for none).
-func crew_start(task: func(void*, usize, Scratch*) -> unit, context: void*, count: usize, threads: usize, width: usize, column: usize) -> Crew*!:
+## 0..<`count`; `crew_finish` makes the caller the last worker. `width`, `column`
+## and `bytes` size each worker's Scratch (0 for none).
+func crew_start(task: func(void*, usize, Scratch*) -> unit, context: void*, count: usize, threads: usize, width: usize, column: usize, bytes: usize = 0) -> Crew*!:
     var workers: usize = threads if threads < count else count
     workers = 64 if workers > 64 else (1 if workers == 0 else workers)
     let crew = try new Crew(pool = Pool(count = count, task = task, context = context)) in memory.heap
@@ -65,11 +66,10 @@ func crew_start(task: func(void*, usize, Scratch*) -> unit, context: void*, coun
         error(failure.code, failure.message)
     for i in 0..<workers:
         crew.slots[i] = Worker(pool = &crew.pool, scratch = Scratch())
-    if width > 0:
-        for i in 0..<workers:
-            allocate_scratch(&crew.slots[i].scratch, width, column) catch failure:
-                release(crew)
-                error(failure.code, failure.message)
+    for i in 0..<workers:
+        allocate_scratch(&crew.slots[i].scratch, width, column, bytes) catch failure:
+            release(crew)
+            error(failure.code, failure.message)
     for i in 1..<workers:
         crew.handles[crew.started] = thread.spawn(worker_main, (void*)&crew.slots[i], name = "jpeg") catch:
             # Fewer threads: the others take its share from the counter.
@@ -77,10 +77,13 @@ func crew_start(task: func(void*, usize, Scratch*) -> unit, context: void*, coun
         crew.started += 1
     return crew
 
-func allocate_scratch(scratch: Scratch*, width: usize, column: usize) -> !:
-    scratch.rows = try new f64[4 * width] in memory.heap
-    scratch.column = try new i32[column + 1] in memory.heap
-    scratch.pixels = try new u8[4 * width] in memory.heap
+func allocate_scratch(scratch: Scratch*, width: usize, column: usize, bytes: usize) -> !:
+    if width > 0:
+        scratch.rows = try new f64[4 * width] in memory.heap
+        scratch.column = try new i32[column + 1] in memory.heap
+        scratch.pixels = try new u8[4 * width] in memory.heap
+    if bytes > 0:
+        scratch.bytes = try alloc u8[bytes] in memory.heap
 
 ## Work on the crew's tasks until none are left, join its threads and free it.
 func crew_finish(crew: Crew*) -> !:
@@ -101,14 +104,16 @@ func release(crew: Crew*):
             free(slot.scratch.column) in memory.heap
         if slot.scratch.pixels.length > 0:
             free(slot.scratch.pixels) in memory.heap
+        if slot.scratch.bytes.length > 0:
+            free(slot.scratch.bytes) in memory.heap
     free(crew.slots) in memory.heap
     free(crew) in memory.heap
 
 ## Run `task` for 0..<`count` on up to `threads` threads, the caller's included.
-func run_tasks(task: func(void*, usize, Scratch*) -> unit, context: void*, count: usize, threads: usize, width: usize = 0, column: usize = 0) -> !:
+func run_tasks(task: func(void*, usize, Scratch*) -> unit, context: void*, count: usize, threads: usize, width: usize = 0, column: usize = 0, bytes: usize = 0) -> !:
     if count == 0:
         return
-    try crew_finish(try crew_start(task, context, count, threads, width, column))
+    try crew_finish(try crew_start(task, context, count, threads, width, column, bytes))
 
 ## The threads a decode uses: `requested`, or every processor for 0; one for a
 ## picture too small to be worth starting threads.

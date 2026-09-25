@@ -1,0 +1,203 @@
+#==============================================================================================
+#
+#   jpeg/encode_transform - Colour conversion, downsampling and the quantized forward DCT
+#
+#   DESCRIPTION:
+#       One band (an MCU row) of input pixels becomes quantized blocks. RGB converts to
+#       YCbCr in 16-bit fixed point and chroma is box-averaged with libjpeg's alternating
+#       rounding bias; edges repeat the last column and row. The forward DCT is the
+#       Arai-Agui-Nakajima float transform (libjpeg's jfdctflt) with the AAN scale
+#       factors and the quantization folded into one multiplier a coefficient, and the
+#       block is stored in zigzag order for the entropy coder.
+#
+#==============================================================================================
+
+## Where band rows come from: row y of the picture is at data + (y - first_row) * stride.
+struct Source:
+    var data: const u8*
+    var stride: usize
+    var first_row: usize
+
+## The luma and chroma quantization tables of ITU T.81 Annex K, natural order.
+let base_luma: u32[64] = [16, 11, 10, 16, 24, 40, 51, 61, 12, 12, 14, 19, 26, 58, 60, 55, 14, 13, 16, 24, 40, 57, 69, 56, 14, 17, 22, 29, 51, 87, 80, 62, 18, 22, 37, 56, 68, 109, 103, 77, 24, 35, 55, 64, 81, 104, 113, 92, 49, 64, 78, 87, 103, 121, 120, 101, 72, 92, 95, 98, 112, 100, 103, 99]
+let base_chroma: u32[64] = [17, 18, 24, 47, 99, 99, 99, 99, 18, 21, 26, 66, 99, 99, 99, 99, 24, 26, 56, 99, 99, 99, 99, 99, 47, 66, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99, 99]
+let aan_scale: f64[8] = [1.0, 1.387039845, 1.306562965, 1.175875602, 1.0, 0.785694958, 0.541196100, 0.275899379]
+
+## The encoder's geometry and per-picture constants.
+struct EncodeFrame:
+    var width: usize
+    var height: usize
+    ## Input bytes a pixel (1 gray, 3 RGB, 4 RGBA) and components coded (1 or 3).
+    var pixel: usize
+    var count: usize
+    ## Luma sampling factors; chroma is always 1x1.
+    var h: usize
+    var v: usize
+    var mcux: usize
+    var mcuy: usize
+    ## Input columns a band covers (whole MCUs) and rows a band.
+    var padded: usize
+    var band_rows: usize
+    var mcu_blocks: usize
+    var band_blocks: usize
+    ## Quantization tables, natural order, luma then chroma, for the DQT segment.
+    var quant: u8[128]
+    ## 1 / (q * aan(u) * aan(v) * 8) in zigzag order, luma then chroma.
+    var divisors: f64[128]
+    var restart: bool
+    var optimize: bool
+
+    ## The frame for a picture; `quality` 1..100 scales the Annex K tables as IJG does.
+    static func make(width: usize, height: usize, pixel: usize, subsampling: Subsampling, quality: i64, restart: bool, optimize: bool) -> EncodeFrame:
+        var f = EncodeFrame(width = width, height = height, pixel = pixel, count = 1 if pixel == 1 else 3, h = 1, v = 1, restart = restart, optimize = optimize)
+        if f.count == 3:
+            f.h = 1 if subsampling == .s444 else 2
+            f.v = 2 if subsampling == .s420 else 1
+        f.mcux = (width + 8 * f.h - 1) // (8 * f.h)
+        f.mcuy = (height + 8 * f.v - 1) // (8 * f.v)
+        f.padded = f.mcux * 8 * f.h
+        f.band_rows = 8 * f.v
+        f.mcu_blocks = f.h * f.v + (2 if f.count == 3 else 0)
+        f.band_blocks = f.mcux * f.mcu_blocks
+        let scale = (u32)(5000 // quality if quality < 50 else 200 - quality * 2)
+        for t in 0..<(usize)2:
+            for i in 0..<(usize)64:
+                let base = base_luma[i] if t == 0 else base_chroma[i]
+                let q = (base * scale + 50) // 100
+                f.quant[t * 64 + i] = (u8)(1 if q < 1 else 255 if q > 255 else q)
+            for k in 0..<(usize)64:
+                let z = zigzag[k]
+                f.divisors[t * 64 + k] = 1.0 / ((f64)f.quant[t * 64 + z] * aan_scale[z // 8] * aan_scale[z % 8] * 8.0)
+        return f
+
+## Scratch bytes a band's transform needs: three planes and four chroma rows.
+func transform_bytes(f: const EncodeFrame*) -> usize:
+    return 3 * f.band_rows * f.padded + 4 * f.padded
+
+## Band `band` of the picture into `blocks` (band_blocks zigzag blocks, MCU after
+## MCU, each MCU's luma blocks row by row then Cb then Cr); `last` gets the DC of
+## each component's last block.
+func transform_band(f: const EncodeFrame*, source: const Source*, band: usize, blocks: i16*, last: i32*, scratch: u8*):
+    let rows = f.band_rows
+    let width = f.padded
+    let luma = scratch
+    let cb = scratch + rows * width
+    let cr = cb + rows * width
+    let cb_rows = cr + rows * width
+    let cr_rows = cb_rows + 2 * width
+    let chroma_width = width // f.h
+    for r in 0..<rows:
+        let y = band * rows + r if band * rows + r < f.height else f.height - 1
+        let row = source.data + (y - source.first_row) * source.stride
+        let out = luma + r * width
+        if f.count == 1:
+            for x in 0..<f.width:
+                out[x] = row[x]
+            for x in f.width..<width:
+                out[x] = row[f.width - 1]
+            continue
+        # YCbCr in 16-bit fixed point, libjpeg's constants; chroma to full-resolution
+        # rows first unless it is kept at full resolution.
+        let full = f.h == 1 and f.v == 1
+        let to_cb = cb + r * width if full else cb_rows + (r % 2) * width
+        let to_cr = cr + r * width if full else cr_rows + (r % 2) * width
+        let step = f.pixel
+        for x in 0..<width:
+            let p = row + (x if x < f.width else f.width - 1) * step
+            let red = (i32)p[0]
+            let green = (i32)p[1]
+            let blue = (i32)p[2]
+            out[x] = (u8)((19595 * red + 38470 * green + 7471 * blue + 32768) >> 16)
+            to_cb[x] = (u8)((-11059 * red - 21709 * green + 32768 * blue + 8421375) >> 16)
+            to_cr[x] = (u8)((32768 * red - 27439 * green - 5329 * blue + 8421375) >> 16)
+        if f.h == 2 and f.v == 1:
+            let dcb = cb + r * chroma_width
+            let dcr = cr + r * chroma_width
+            for i in 0..<chroma_width:
+                let bias = (i32)(i & 1)
+                dcb[i] = (u8)(((i32)to_cb[2 * i] + (i32)to_cb[2 * i + 1] + bias) >> 1)
+                dcr[i] = (u8)(((i32)to_cr[2 * i] + (i32)to_cr[2 * i + 1] + bias) >> 1)
+        elif f.v == 2 and r % 2 == 1:
+            let dcb = cb + (r // 2) * chroma_width
+            let dcr = cr + (r // 2) * chroma_width
+            let a = cb_rows
+            let b = cb_rows + width
+            let c = cr_rows
+            let d = cr_rows + width
+            for i in 0..<chroma_width:
+                let bias = 1 + (i32)(i & 1)
+                dcb[i] = (u8)(((i32)a[2 * i] + (i32)a[2 * i + 1] + (i32)b[2 * i] + (i32)b[2 * i + 1] + bias) >> 2)
+                dcr[i] = (u8)(((i32)c[2 * i] + (i32)c[2 * i + 1] + (i32)d[2 * i] + (i32)d[2 * i + 1] + bias) >> 2)
+    # Blocks in MCU order.
+    var index: usize = 0
+    for mcu in 0..<f.mcux:
+        for by in 0..<f.v:
+            for bx in 0..<f.h:
+                forward_block(luma + by * 8 * width + (mcu * f.h + bx) * 8, width, &f.divisors[0], blocks + index * 64)
+                last[0] = (i32)blocks[index * 64]
+                index += 1
+        if f.count == 3:
+            forward_block(cb + mcu * 8, chroma_width, &f.divisors[64], blocks + index * 64)
+            last[1] = (i32)blocks[index * 64]
+            index += 1
+            forward_block(cr + mcu * 8, chroma_width, &f.divisors[64], blocks + index * 64)
+            last[2] = (i32)blocks[index * 64]
+            index += 1
+
+## The quantized forward DCT of the 8x8 samples at `at` (rows `stride` apart) into
+## `out` in zigzag order.
+func forward_block(at: const u8*, stride: usize, divisors: const f64*, out: i16*):
+    var t: f64[64] = ---
+    for r in 0..<(usize)8:
+        let p = at + r * stride
+        let line = &t[r * 8]
+        aan(line, 1, (f64)p[0] - 128.0, (f64)p[1] - 128.0, (f64)p[2] - 128.0, (f64)p[3] - 128.0, (f64)p[4] - 128.0, (f64)p[5] - 128.0, (f64)p[6] - 128.0, (f64)p[7] - 128.0)
+    for c in 0..<(usize)8:
+        let column = &t[c]
+        aan(column, 8, column[0], column[8], column[16], column[24], column[32], column[40], column[48], column[56])
+    for k in 0..<(usize)64:
+        out[k] = quantize(t[zigzag[k]] * divisors[k], k == 0)
+
+## One 8-point AAN DCT of d0..d7 into out[0], out[step], ... out[7 * step], scaled
+## by 8 * aan(k) (the divisors undo that).
+inline func aan(out: f64*, step: usize, d0: f64, d1: f64, d2: f64, d3: f64, d4: f64, d5: f64, d6: f64, d7: f64):
+    let tmp0 = d0 + d7
+    let tmp7 = d0 - d7
+    let tmp1 = d1 + d6
+    let tmp6 = d1 - d6
+    let tmp2 = d2 + d5
+    let tmp5 = d2 - d5
+    let tmp3 = d3 + d4
+    let tmp4 = d3 - d4
+    # Even part.
+    let tmp10 = tmp0 + tmp3
+    let tmp13 = tmp0 - tmp3
+    let tmp11 = tmp1 + tmp2
+    let tmp12 = tmp1 - tmp2
+    out[0] = tmp10 + tmp11
+    out[4 * step] = tmp10 - tmp11
+    let z1 = (tmp12 + tmp13) * 0.707106781
+    out[2 * step] = tmp13 + z1
+    out[6 * step] = tmp13 - z1
+    # Odd part.
+    let o10 = tmp4 + tmp5
+    let o11 = tmp5 + tmp6
+    let o12 = tmp6 + tmp7
+    let z5 = (o10 - o12) * 0.382683433
+    let z2 = 0.541196100 * o10 + z5
+    let z4 = 1.306562965 * o12 + z5
+    let z3 = o11 * 0.707106781
+    let z11 = tmp7 + z3
+    let z13 = tmp7 - z3
+    out[5 * step] = z13 + z2
+    out[3 * step] = z13 - z2
+    out[step] = z11 + z4
+    out[7 * step] = z11 - z4
+
+## A scaled coefficient rounded to the nearest integer and kept to what baseline
+## Huffman coding can carry: 11 bits for DC, 10 for AC.
+inline func quantize(v: f64, dc: bool) -> i16:
+    let t = v + magic
+    let n = (i64)(t.bits() -% 0x4338000000000000)
+    let bound: i64 = 2047 if dc else 1023
+    return (i16)(-bound if n < -bound else bound if n > bound else n)

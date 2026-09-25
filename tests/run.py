@@ -9,9 +9,12 @@ and C modes against the fixtures:
 - scaled decodes (1/2, 1/4, 1/8) have the scaled size, and with Pillow present
   stay within 4 of libjpeg's reduced decodes, as full-size decodes stay within 4
   of libjpeg's (except 3:1 and 4:1 sampling, which libjpeg replicates);
-- truncated and corrupted files fail cleanly, never crash or hang.
+- truncated and corrupted files fail cleanly, never crash or hang;
+- the encoder gives the same bytes on one thread, on all, and streamed, for every
+  sampling, restart and table option; its files decode (here and, with Pillow, in
+  libjpeg identically within 4) close to the source.
 """
-import hashlib, os, random, struct, subprocess, sys, tempfile
+import hashlib, io, os, random, struct, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -129,6 +132,56 @@ def check_drivers(tmp, flags):
                     fail(f"{name}: a damaged file ended the process with {result.returncode}")
                 damaged += 1
     print(f"ok    {damaged} decodes of damaged files ended cleanly")
+    check_encoder(tmp, flags, scaled)
+
+
+def check_encoder(tmp, flags, scaled):
+    encode = tmp / "encode"
+    run([BASE, "build", ROOT / "tests/encode.lucb", *flags, "-o", encode], check=True)
+    source, decoded = tmp / "source", tmp / "decoded"
+    checked = 0
+    for name in ["mt_b420.jpg", "mt_b444.jpg", "b444_37x35.jpg", "rgb.jpg", "b420_1x1.jpg"]:
+        fixture = ROOT / "tests/fixtures" / name
+        run([scaled, fixture, source, 1, "rgb"], check=True)
+        original = read_raw(source)[3]
+        for sampling, options in [("420", "-"), ("444", "r"), ("422", "o"), ("420", "ro")]:
+            outputs = []
+            for mode, threads in [("rgba", 0), ("rgba", 1), ("stream", 0)]:
+                out = tmp / f"{mode}{threads}.jpg"
+                if run([encode, fixture, out, 1, mode, 90, sampling, options, threads], capture_output=True).returncode != 0:
+                    fail(f"{name}: {mode} {sampling} {options} encode failed")
+                outputs.append(out.read_bytes())
+            if outputs[1] != outputs[0] or outputs[2] != outputs[0]:
+                fail(f"{name}: {sampling} {options} differs between threads or streaming")
+            encoded = tmp / "rgba0.jpg"
+            if run([scaled, encoded, decoded, 1, "rgb"]).returncode != 0:
+                fail(f"{name}: {sampling} {options} output does not decode")
+            pixels = read_raw(decoded)[3]
+            mean = sum(abs(a - b) for a, b in zip(original, pixels)) / len(pixels)
+            # As close to the source as libjpeg's encoding at the same settings.
+            bound = 8.0
+            if Image:
+                width, height = read_raw(source)[:2]
+                picture = Image.frombytes("RGB", (width, height), original)
+                ours = io.BytesIO()
+                picture.save(ours, "JPEG", quality=90, subsampling={"444": 0, "422": 1, "420": 2}[sampling])
+                with Image.open(io.BytesIO(ours.getvalue())) as image:
+                    theirs = image.convert("RGB").tobytes()
+                bound = sum(abs(a - b) for a, b in zip(original, theirs)) / len(theirs) + 0.5
+            if mean > bound:
+                fail(f"{name}: {sampling} {options} is {mean:.2f} from the source on average, over {bound:.2f}")
+            if Image:
+                with Image.open(encoded) as image:
+                    reference = image.convert("RGB").tobytes()
+                worst = max(abs(a - b) for a, b in zip(reference, pixels))
+                if worst > 4:
+                    fail(f"{name}: {sampling} {options} decodes {worst} apart in libjpeg")
+            checked += 1
+        for mode in ["gray", "raster"]:
+            if run([encode, fixture, tmp / "other.jpg", 1, mode, 90], capture_output=True).returncode != 0 or run([scaled, tmp / "other.jpg", decoded, 1, "rgb"]).returncode != 0:
+                fail(f"{name}: {mode} encode does not round-trip")
+            checked += 1
+    print(f"ok    {checked} encodings identical across threads and streaming, decoding close to their source")
 
 
 for flags in MODES:

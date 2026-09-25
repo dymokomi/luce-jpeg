@@ -7,4 +7,6 @@ idct.lucb
 color.lucb
 render.lucb
 encode.lucb
+encode_transform.lucb
+encode_entropy.lucb
 tests.lucb
