@@ -1,10 +1,10 @@
 #prisma 4.0
 def package "luce-jpeg" {
     str owner = "dymokomi"
-    str version = "0.1.1"
+    str version = "0.2.0"
     str kind = "package"
     str language = "luce-base"
-    str description = "A baseline and progressive JPEG decoder and a baseline encoder for Luce/Base."
+    str description = "A fast multithreaded baseline and progressive JPEG decoder (8-bit, row bands, 1/2-1/8 scaled) and a baseline encoder for Luce/Base."
     str readme = "README.md"
 
     def dependency "luce-raster" {
