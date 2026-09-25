@@ -1,0 +1,386 @@
+#==============================================================================================
+#
+#   jpeg/render - The worker crew, render geometry, the band schedule and targets
+#
+#   DESCRIPTION:
+#       Rendering runs in MCU-row bands on every processor, the calling thread one of
+#       the workers: the IDCT of a band's blocks into component planes, and the band's
+#       output rows. A band's rows interpolate one plane row into each neighbouring
+#       band, so its colour task waits for the IDCT of those. Tasks are handed out in
+#       the order I0, I1, C0, I2, C1, ... (IDCT, colour one band behind).
+#
+#       For a baseline picture coded in one interleaved scan, the calling thread
+#       entropy-decodes MCU rows while the workers render the rows it has finished, so
+#       nearly all of the rendering hides behind the entropy decoding.
+#
+#       Row callbacks render in groups of bands into one buffer after decoding and hand
+#       each group on in order.
+#
+#==============================================================================================
+
+## A worker's rows for one output row: component samples, an interpolated plane
+## row and 8-bit pixels.
+struct Scratch:
+    var rows: f64[]
+    var column: i32[]
+    var pixels: u8[]
+
+struct Pool:
+    var next: @usize
+    var count: usize
+    var task: func(void*, usize, Scratch*) -> unit
+    var context: void*
+
+struct Worker:
+    var pool: Pool*
+    var scratch: Scratch
+
+## Workers draining one pool of tasks: started, then finished on the caller.
+struct Crew:
+    var pool: Pool
+    var slots: Worker[]
+    var handles: thread.Handle[64]
+    var started: usize
+
+func worker_main(context: void*?):
+    drain((Worker*)(context else return))
+
+func drain(worker: Worker*):
+    let pool = worker.pool
+    while true:
+        let index = pool.next.add(1)
+        if index >= pool.count:
+            return
+        pool.task(pool.context, index, &worker.scratch)
+
+## Start up to `threads - 1` threads on `task(context, i, scratch)` for i in
+## 0..<`count`; `crew_finish` makes the caller the last worker. `width` and
+## `column` size each worker's Scratch (0 for none).
+func crew_start(task: func(void*, usize, Scratch*) -> unit, context: void*, count: usize, threads: usize, width: usize, column: usize) -> Crew*!:
+    var workers: usize = threads if threads < count else count
+    workers = 64 if workers > 64 else (1 if workers == 0 else workers)
+    let crew = try new Crew(pool = Pool(count = count, task = task, context = context)) in memory.heap
+    crew.slots = alloc Worker[workers] in memory.heap catch failure:
+        free(crew) in memory.heap
+        error(failure.code, failure.message)
+    for i in 0..<workers:
+        crew.slots[i] = Worker(pool = &crew.pool, scratch = Scratch())
+    if width > 0:
+        for i in 0..<workers:
+            allocate_scratch(&crew.slots[i].scratch, width, column) catch failure:
+                release(crew)
+                error(failure.code, failure.message)
+    for i in 1..<workers:
+        crew.handles[crew.started] = thread.spawn(worker_main, (void*)&crew.slots[i], name = "jpeg") catch:
+            # Fewer threads: the others take its share from the counter.
+            break
+        crew.started += 1
+    return crew
+
+func allocate_scratch(scratch: Scratch*, width: usize, column: usize) -> !:
+    scratch.rows = try new f64[4 * width] in memory.heap
+    scratch.column = try new i32[column + 1] in memory.heap
+    scratch.pixels = try new u8[4 * width] in memory.heap
+
+## Work on the crew's tasks until none are left, join its threads and free it.
+func crew_finish(crew: Crew*) -> !:
+    drain(&crew.slots[0])
+    var failed = false
+    for i in 0..<crew.started:
+        crew.handles[i].join() catch:
+            failed = true
+    release(crew)
+    if failed:
+        error(invalid, "JPEG worker thread could not be joined")
+
+func release(crew: Crew*):
+    for slot in crew.slots:
+        if slot.scratch.rows.length > 0:
+            free(slot.scratch.rows) in memory.heap
+        if slot.scratch.column.length > 0:
+            free(slot.scratch.column) in memory.heap
+        if slot.scratch.pixels.length > 0:
+            free(slot.scratch.pixels) in memory.heap
+    free(crew.slots) in memory.heap
+    free(crew) in memory.heap
+
+## Run `task` for 0..<`count` on up to `threads` threads, the caller's included.
+func run_tasks(task: func(void*, usize, Scratch*) -> unit, context: void*, count: usize, threads: usize, width: usize = 0, column: usize = 0) -> !:
+    if count == 0:
+        return
+    try crew_finish(try crew_start(task, context, count, threads, width, column))
+
+## The threads a decode uses: `requested`, or every processor for 0; one for a
+## picture too small to be worth starting threads.
+func thread_count(requested: usize, pixels: usize) -> usize:
+    if pixels < 65536:
+        return 1
+    let wanted = (usize)os.cpus() if requested == 0 else requested
+    return 1 if wanted == 0 else 64 if wanted > 64 else wanted
+
+## Where rendered rows go: 8-bit pixels, a Raster's f64 samples, or a row sink
+## fed from a buffer of whole bands.
+struct Target:
+    var bytes: u8[]
+    var doubles: f64[]
+    ## Values a pixel: 1 or 3 for a Raster, 3 or 4 for bytes.
+    var pixel: usize
+    var sink: RowSink?
+    var context: void*?
+    ## The output row stored at the start of `bytes`.
+    var first_row: usize
+
+struct RenderJob:
+    var d: const Decoder*
+    var target: const Target*
+    var cosines: Cosines
+    var quant: f64[256]
+    ## The output size, output rows a band, and the band colour task 0 renders.
+    var width: usize
+    var height: usize
+    var band_rows: usize
+    var first_band: usize
+
+## Plan the planes for a decode at 1/`scale` and set up its job: each component's
+## IDCT output size, its plane, and its sampling ratio against output pixels.
+func plan(d: Decoder*, target: const Target*, scale: usize) -> RenderJob*!:
+    let n = 8 // scale
+    let width = (d.width + scale - 1) // scale
+    let height = (d.height + scale - 1) // scale
+    var allocated: usize = 0
+    for i in 0..<d.count:
+        let c = &d.components[i]
+        if not d.quant_present[c.quant]:
+            error(corrupt, "JPEG component lacks quantization or DC scan")
+        allocated += c.coefficients.length * 2 + c.nonzero.length * 8
+        # Scaled, a subsampled component takes a larger square IDCT where that
+        # replaces upsampling by a power of two in both directions, as libjpeg does.
+        var size = n
+        while size < 8 and (d.max_h * n) % (c.horizontal * size * 2) == 0 and (d.max_v * n) % (c.vertical * size * 2) == 0:
+            size *= 2
+        c.out_w = size
+        c.out_h = size
+        c.stride = c.bx * c.out_w
+        c.rows = c.by * c.out_h
+        c.num_x = c.horizontal * c.out_w
+        c.den_x = n * d.max_h
+        c.num_y = c.vertical * c.out_h
+        c.den_y = n * d.max_v
+        c.valid_w = (width * c.num_x + c.den_x - 1) // c.den_x
+        c.valid_h = (height * c.num_y + c.den_y - 1) // c.den_y
+        # Scaled output upsamples as libjpeg does: triangle for 2:1 when there are
+        # more than two samples and the scale is above 1/8, else replication.
+        let halves = (c.num_x == c.den_x or c.num_x * 2 == c.den_x) and (c.num_y == c.den_y or c.num_y * 2 == c.den_y)
+        c.replicate = scale > 1 and (c.num_x != c.den_x or c.num_y != c.den_y) and (scale == 8 or not halves or c.valid_w <= 2)
+        allocated += c.stride * c.rows
+        if allocated > d.max_bytes:
+            error(limit, "JPEG coefficient and sample buffers exceed byte limit")
+        if c.plane.length > 0:
+            free(c.plane) in memory.heap
+        c.plane = try alloc u8[c.stride * c.rows] in memory.heap
+    let job = try new RenderJob(d = d, target = target, cosines = Cosines.make(), width = width, height = height, band_rows = d.max_v * n, first_band = 0) in memory.heap
+    for i in 0..<(usize)256:
+        job.quant[i] = (f64)d.quant[i]
+    return job
+
+## The widest plane, for Scratch.column.
+func widest_plane(d: const Decoder*) -> usize:
+    var column: usize = 0
+    for i in 0..<d.count:
+        column = d.components[i].stride if d.components[i].stride > column else column
+    return column
+
+## The IDCT of MCU row `band`'s blocks into the planes.
+func idct_band(job: const RenderJob*, band: usize):
+    let d = job.d
+    for i in 0..<d.count:
+        let c = &d.components[i]
+        let across = &job.cosines.by_frequency[cosine_level(c.out_w) * 64]
+        let down = &job.cosines.table[cosine_level(c.out_h) * 64]
+        let quant = &job.quant[c.quant * 64]
+        let coefficients = c.coefficients.data
+        let plane = c.plane.data
+        for by in band * c.vertical..<(band + 1) * c.vertical:
+            for bx in 0..<c.bx:
+                idct_block(coefficients + (by * c.bx + bx) * 64, quant, across, down, c.out_w, c.out_h, plane + by * c.out_h * c.stride + bx * c.out_w, c.stride)
+
+func idct_task(context: void*, band: usize, scratch: Scratch*):
+    idct_band((RenderJob*)context, band)
+
+## Band `band`'s output rows into the target.
+func color_band(job: const RenderJob*, band: usize, scratch: Scratch*):
+    let d = job.d
+    let target = job.target
+    let width = job.width
+    let first = band * job.band_rows
+    let last = first + job.band_rows if first + job.band_rows < job.height else job.height
+    let rows = scratch.rows.data
+    let pixel = target.pixel
+    for y in first..<last:
+        for i in 0..<d.count:
+            component_row(&d.components[i], y, width, rows + i * width, scratch.column.data)
+        if target.doubles.length > 0:
+            let out = scratch.pixels.data
+            convert_row(d, rows, width, out, pixel)
+            let base = target.doubles.data + y * width * pixel
+            for v in 0..<width * pixel:
+                base[v] = (f64)out[v]
+        else:
+            convert_row(d, rows, width, target.bytes.data + (y - target.first_row) * width * pixel, pixel)
+
+func color_task(context: void*, index: usize, scratch: Scratch*):
+    let job = (RenderJob*)context
+    color_band(job, index + job.first_band, scratch)
+
+## A one-way gate: shut until opened, then open for good. Waiters sleep in the
+## kernel; passing an open gate is one load.
+struct Gate:
+    var opened: @u32
+    var sleepers: sync.Semaphore
+
+    mutating func open():
+        self.opened.store(1, .release)
+        self.sleepers.release()
+
+    mutating func pass():
+        if self.opened.load(.acquire) == 0:
+            # Take the permit `open` leaves and hand it on to the next waiter.
+            self.sleepers.acquire()
+            self.sleepers.release()
+
+## IDCT and colour tasks for every band, with the waits between them. A waiter
+## sleeps at the one band gate it needs, so a band finishing wakes only its own.
+struct Schedule:
+    var job: RenderJob*
+    ## MCU rows: IDCT bands. Colour bands can be fewer (padding rows).
+    var bands: usize
+    var color_bands: usize
+    ## Per band: its coefficients are complete; its IDCT is done.
+    var ready: Gate[]
+    var done: Gate[]
+    ## Set when the decode fails: the remaining tasks do nothing.
+    var stopped: @u32
+
+## Wait at `gate`; false when the decode stopped meanwhile.
+func await(s: Schedule*, gate: Gate*) -> bool:
+    gate.pass()
+    return s.stopped.load(.acquire) == 0
+
+## Task `t` of 2 * bands: I0, I1, C0, I2, C1, ..., I(n-1), C(n-2), C(n-1).
+func schedule_task(context: void*, t: usize, scratch: Scratch*):
+    let s = (Schedule*)context
+    if t == 0 or (t % 2 == 1 and (t + 1) // 2 < s.bands):
+        let band = 0 if t == 0 else (t + 1) // 2
+        if not await(s, &s.ready[band]):
+            return
+        idct_band(s.job, band)
+        s.done[band].open()
+        return
+    let band = t // 2 - 1 if t % 2 == 0 else (t - 1) // 2
+    if band >= s.color_bands:
+        return
+    # The IDCT of this band and its neighbours, latest first.
+    let high = band + 1 if band + 1 < s.bands else band
+    let low = band - 1 if band > 0 else 0
+    var b = high + 1
+    while b > low:
+        b -= 1
+        if not await(s, &s.done[b]):
+            return
+    color_band(s.job, band, scratch)
+
+## A schedule over `job`'s bands, every band's coefficients complete when `decoded`.
+func schedule_new(job: RenderJob*, decoded: bool) -> Schedule*!:
+    let d = job.d
+    let s = try new Schedule(job = job, bands = d.mcuy, color_bands = (job.height + job.band_rows - 1) // job.band_rows) in memory.heap
+    s.ready = new Gate[d.mcuy] in memory.heap catch failure:
+        free(s) in memory.heap
+        error(failure.code, failure.message)
+    s.done = new Gate[d.mcuy] in memory.heap catch failure:
+        free(s.ready) in memory.heap
+        free(s) in memory.heap
+        error(failure.code, failure.message)
+    if decoded:
+        for i in 0..<d.mcuy:
+            s.ready[i].open()
+    return s
+
+## Stop a schedule's remaining tasks and release everything waiting.
+func schedule_stop(s: Schedule*):
+    s.stopped.store(1, .release)
+    for i in 0..<s.bands:
+        s.ready[i].open()
+        s.done[i].open()
+
+func schedule_free(s: Schedule*):
+    free(s.ready) in memory.heap
+    free(s.done) in memory.heap
+    free(s) in memory.heap
+
+## Whether a scan can be decoded while its rows render: the frame's one
+## interleaved baseline scan, not split at restart markers, going to pixels.
+func pipelines(d: const Decoder*, scan: const Scan*) -> bool:
+    if d.progressive or d.threads < 2 or scan.count != d.count or splits(d, scan):
+        return false
+    if let target = d.target:
+        if target.sink != none:
+            return false
+        return d.count > 1 or (d.components[0].horizontal == 1 and d.components[0].vertical == 1)
+    return false
+
+## Decode the frame's one interleaved scan on this thread while workers render
+## each MCU row once it is complete.
+func pipelined_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
+    try check_tables(d, scan)
+    let target = d.target else trap("pipelined without a target")
+    let job = try plan(d, target, d.scale)
+    defer free(job) in memory.heap
+    let s = try schedule_new(job, false)
+    defer schedule_free(s)
+    let crew = try crew_start(schedule_task, (void*)s, 2 * d.mcuy, d.threads, job.width, widest_plane(d))
+    var b = Bits.over(d.data, reader.position)
+    var cursor = Cursor.at(d, 0)
+    for row in 0..<scan.down:
+        sequential_range(d, scan, &b, &cursor, row * scan.across, (row + 1) * scan.across) catch failure:
+            # Release the waiting workers, finish, and report.
+            schedule_stop(s)
+            crew_finish(crew) catch:
+                recover ()
+            error(failure.code, failure.message)
+        s.ready[row].open()
+    try crew_finish(crew)
+    if b.leftover():
+        error(corrupt, "JPEG marker prefix missing")
+    reader.position = b.pos
+    d.rendered = true
+
+## Render a completely read decoder into its target.
+func render(d: Decoder*) -> !:
+    let target = d.target else trap("render without a target")
+    let job = try plan(d, target, d.scale)
+    defer free(job) in memory.heap
+    let width = job.width
+    let column = widest_plane(d)
+    let bands = (job.height + job.band_rows - 1) // job.band_rows
+    if let deliver = target.sink:
+        # Row callbacks: every IDCT, then a few bands a thread at a time into one
+        # buffer, handed on in order.
+        try run_tasks(idct_task, (void*)job, d.mcuy, d.threads)
+        let per = d.threads * 2
+        let buffer = try new u8[per * job.band_rows * width * target.pixel] in memory.heap
+        defer free(buffer) in memory.heap
+        target.bytes = buffer
+        var band: usize = 0
+        while band < bands:
+            let count = per if band + per <= bands else bands - band
+            job.first_band = band
+            target.first_row = band * job.band_rows
+            try run_tasks(color_task, (void*)job, count, d.threads, width, column)
+            let first = band * job.band_rows
+            let last = first + count * job.band_rows if first + count * job.band_rows < job.height else job.height
+            try deliver(target.context, first, last - first, buffer[..<(last - first) * width * target.pixel])
+            band += count
+        return
+    let s = try schedule_new(job, true)
+    defer schedule_free(s)
+    try run_tasks(schedule_task, (void*)s, 2 * d.mcuy, d.threads, width, column)

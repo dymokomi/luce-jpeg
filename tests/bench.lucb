@@ -1,0 +1,49 @@
+## Times decoding one file: `bench <file.jpg> [repeats] [raster|rgba|rgb|rows] [scale] [threads]`.
+## Prints each run and the best, in milliseconds.
+import files
+import c
+import time
+import memory
+import strings
+import jpeg
+from raster import Raster
+
+func discard_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    let total = (u64*)(context else return)
+    *total += (u64)bytes.length
+
+pub func main(arguments: str[]) -> i32!:
+    let encoded = try files.read((c.str)arguments[1])
+    let repeats = (usize)(strings.parse_u64(arguments[2]) else 1) if arguments.length > 2 else 1
+    let mode = arguments[3] if arguments.length > 3 else "raster"
+    let scale = (usize)(strings.parse_u64(arguments[4]) else 1) if arguments.length > 4 else 1
+    let threads = (usize)(strings.parse_u64(arguments[5]) else 0) if arguments.length > 5 else 0
+    let info = try jpeg.info(encoded)
+    let options = jpeg.Options(scale = scale, threads = threads)
+    var best: u64 = 0
+    for r in 0..<repeats:
+        let start = time.now()
+        if mode == "raster":
+            var raster = Raster()
+            raster.encoded = encoded
+            try jpeg.probe(&raster)
+            try raster.allocate()
+            try jpeg.decode(&raster)
+            var empty: u8[]
+            raster.encoded = empty
+            raster.close()
+        elif mode == "rows":
+            var total: u64 = 0
+            try jpeg.decode_rows(encoded, discard_rows, (void*)&total, options = options)
+        else:
+            let pixel: usize = 4 if mode == "rgba" else 3
+            let out = try alloc u8[info.scaled_width(scale) * info.scaled_height(scale) * pixel] in memory.heap
+            if pixel == 4:
+                try jpeg.decode_rgba8(encoded, out, options)
+            else:
+                try jpeg.decode_rgb8(encoded, out, options)
+            free(out) in memory.heap
+        let spent = time.since(start)
+        best = spent if r == 0 or spent < best else best
+    print(f"{info.width}x{info.height} {mode} 1/{scale}: best {best // 1000000}.{(best // 100000) % 10} ms of {repeats}")
+    return 0

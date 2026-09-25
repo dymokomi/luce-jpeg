@@ -1,0 +1,26 @@
+## Decodes one JPEG through the Raster API and writes its samples as bytes:
+## `dump <in.jpg> <out.raw>`, a 12-byte header (width, height, channels as
+## little-endian u32) then one byte a sample.
+import files
+import c
+import memory
+import jpeg
+from raster import Raster
+from binary import Buffer
+
+pub func main(arguments: str[]) -> i32!:
+    var raster = Raster()
+    defer raster.close()
+    raster.encoded = try files.read((c.str)arguments[1])
+    try jpeg.probe(&raster)
+    try raster.allocate()
+    try jpeg.decode(&raster)
+    var raw = Buffer()
+    defer raw.close()
+    try raw.uint((u64)raster.width, 4)
+    try raw.uint((u64)raster.height, 4)
+    try raw.uint((u64)raster.channels.length, 4)
+    for value in raster.pixels:
+        try raw.byte((u8)value)
+    try files.write((c.str)arguments[2], raw.view())
+    return 0

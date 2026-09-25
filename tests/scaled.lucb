@@ -1,0 +1,54 @@
+## Decodes one JPEG to 8-bit pixels at 1/scale through `decode_rgb8`, `decode_rgba8`
+## or `decode_rows`: `scaled <in.jpg> <out.raw> <scale> [rgb|rgba|rows] [threads]`,
+## writing a 12-byte header (width, height, bytes a pixel as little-endian u32)
+## then the pixel bytes.
+import files
+import c
+import memory
+import strings
+import jpeg
+from binary import Buffer
+
+struct Collected:
+    var out: Buffer*
+    var next_row: usize
+    var failed: bool
+
+func collect(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    let collected = (Collected*)(context else return)
+    if first != collected.next_row:
+        collected.failed = true
+    collected.next_row = first + rows
+    try collected.out.put(bytes)
+
+pub func main(arguments: str[]) -> i32!:
+    let encoded = try files.read((c.str)arguments[1])
+    let scale = (usize)(strings.parse_u64(arguments[3]) else 1)
+    let mode = arguments[4] if arguments.length > 4 else "rgb"
+    let threads = (usize)(strings.parse_u64(arguments[5]) else 0) if arguments.length > 5 else 0
+    let info = try jpeg.info(encoded)
+    let width = info.scaled_width(scale)
+    let height = info.scaled_height(scale)
+    let pixel: usize = 4 if mode == "rgba" else 3
+    var raw = Buffer()
+    defer raw.close()
+    try raw.uint((u64)width, 4)
+    try raw.uint((u64)height, 4)
+    try raw.uint((u64)pixel, 4)
+    let options = jpeg.Options(scale = scale, threads = threads)
+    if mode == "rows":
+        var collected = Collected(out = &raw, next_row = 0, failed = false)
+        try jpeg.decode_rows(encoded, collect, (void*)&collected, layout = .rgb, options = options)
+        if collected.failed or collected.next_row != height:
+            print("rows out of order or missing")
+            return 1
+    else:
+        let out = try alloc u8[width * height * pixel] in memory.heap
+        defer free(out) in memory.heap
+        if pixel == 4:
+            try jpeg.decode_rgba8(encoded, out, options)
+        else:
+            try jpeg.decode_rgb8(encoded, out, options)
+        try raw.put(out)
+    try files.write((c.str)arguments[2], raw.view())
+    return 0

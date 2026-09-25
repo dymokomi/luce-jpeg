@@ -1,0 +1,265 @@
+#==============================================================================================
+#
+#   jpeg/sequential - Baseline scans, split across threads at restart markers
+#
+#   DESCRIPTION:
+#       A sequential scan codes every coefficient of its blocks at once. Its restart
+#       intervals are independent (predictors reset, byte aligned, marker between), so
+#       when a scan has several, one pass finds the markers and the intervals decode on
+#       every processor. Otherwise the scan decodes on the calling thread; everything
+#       after entropy decoding is parallel anyway.
+#
+#==============================================================================================
+
+## Decode one block of a sequential scan into `block` (zeroed, natural order).
+## The bit arithmetic wraps: every count is bounded by the refill above it.
+func sequential_block(b: Bits*, dc: const Huffman*, ac: const Huffman*, predictor: i32*, block: i16*) -> !:
+    if b.bits < 32:
+        b.fill()
+    var acc = b.acc
+    var bits = b.bits
+    # DC: a size category, then that many bits of difference. At most 27 bits.
+    var size: u32 = 0
+    let entry = (u32)dc.lookup[(usize)(acc >> peek)]
+    if entry != 0:
+        let length = entry >> 8
+        size = entry & 255
+        acc <<= length
+        bits = bits -% length
+    else:
+        let (length, value) = slow_symbol(dc, acc)
+        if length == 0:
+            error(corrupt, "invalid JPEG Huffman code")
+        size = value
+        acc <<= length
+        bits = bits -% length
+    if size > 11:
+        error(corrupt, "JPEG DC difference too large")
+    var diff: i32 = 0
+    if size > 0:
+        diff = extend((u32)(acc >> (64 - size)), size)
+        acc <<= size
+        bits = bits -% size
+    let dc_value = *predictor + diff
+    if dc_value < -32768 or dc_value > 32767:
+        error(corrupt, "JPEG DC predictor out of range")
+    *predictor = dc_value
+    block[0] = (i16)dc_value
+    # AC: run/size symbols up to the end of block. At most 26 bits each.
+    let fast = &ac.fast_ac[0]
+    let lookup = &ac.lookup[0]
+    let order = &zigzag[0]
+    let data = b.data
+    let end = b.end
+    var k: usize = 1
+    while k < 64:
+        if bits < 32:
+            # Four more bytes inline when none is 0xFF, else the full refill.
+            let at = b.pos
+            var slow = true
+            if at + 4 <= end:
+                let p = data + at
+                let word = ((u64)p[0] << 24) | ((u64)p[1] << 16) | ((u64)p[2] << 8) | (u64)p[3]
+                if ((~word -% 0x01010101) & word & 0x80808080) == 0:
+                    acc |= word << (32 - bits)
+                    bits = bits +% 32
+                    b.pos = at + 4
+                    slow = false
+            if slow:
+                b.acc = acc
+                b.bits = bits
+                b.fill()
+                acc = b.acc
+                bits = b.bits
+        let look = (usize)(acc >> peek)
+        let hit = fast[look]
+        if hit != 0:
+            # Run, value and length from one lookup.
+            k = k +% (usize)((hit >> 8) & 15)
+            let used = (u32)(hit & 255)
+            acc <<= used
+            bits = bits -% used
+            if k > 63:
+                error(corrupt, "JPEG AC run exceeds spectral band")
+            block[order[k]] = (i16)(hit >> 16)
+            k = k +% 1
+            continue
+        var symbol: u32 = 0
+        let found = (u32)lookup[look]
+        if found != 0:
+            let length = found >> 8
+            symbol = found & 255
+            acc <<= length
+            bits = bits -% length
+        else:
+            let (length, value) = slow_symbol(ac, acc)
+            if length == 0:
+                error(corrupt, "invalid JPEG Huffman code")
+            symbol = value
+            acc <<= length
+            bits = bits -% length
+        let run = (usize)(symbol >> 4)
+        let magnitude = symbol & 15
+        if magnitude == 0:
+            if run == 15:
+                k = k +% 16
+                if k > 64:
+                    error(corrupt, "JPEG zero run exceeds spectral band")
+                continue
+            if run != 0:
+                error(corrupt, "invalid sequential JPEG EOB")
+            break
+        if magnitude > 10:
+            error(corrupt, "JPEG AC coefficient too large")
+        k = k +% run
+        if k > 63:
+            error(corrupt, "JPEG AC run exceeds spectral band")
+        block[order[k]] = (i16)extend((u32)(acc >> (64 - magnitude)), magnitude)
+        acc <<= magnitude
+        bits = bits -% magnitude
+        k = k +% 1
+    b.acc = acc
+    b.bits = bits
+    if bits < b.padded:
+        error(corrupt, "unexpected JPEG marker inside entropy data")
+
+## Where a sequential decode stands between calls: DC predictors, the next
+## restart marker, and the MCU the reader started at (which needs no marker).
+struct Cursor:
+    var predictors: i32[4]
+    var expected: u8
+    var origin: usize
+
+    ## A cursor for a reader standing at MCU `origin`, the start of a restart
+    ## interval or of the scan; interval i ends at marker RST(i mod 8).
+    static func at(d: const Decoder*, origin: usize) -> Cursor:
+        let interval = origin // d.restart if d.restart > 0 else 0
+        return Cursor(predictors = i32[4](0), expected = (u8)(208 + interval % 8), origin = origin)
+
+## Decode MCUs `first..<last` of a sequential scan, continuing from `cursor`.
+func sequential_range(d: const Decoder*, scan: const Scan*, b: Bits*, cursor: Cursor*, first: usize, last: usize) -> !:
+    let one = scan.count == 1
+    for mcu in first..<last:
+        if d.restart > 0 and mcu != cursor.origin and mcu % d.restart == 0:
+            try b.restart(cursor.expected)
+            cursor.expected = next_restart(cursor.expected)
+            cursor.predictors = i32[4](0)
+        let mx = mcu % scan.across
+        let my = mcu // scan.across
+        for i in 0..<scan.count:
+            let c = &d.components[scan.selected[i]]
+            let dc = &d.tables[c.dc]
+            let ac = &d.tables[c.ac + 4]
+            let horizontal: usize = 1 if one else c.horizontal
+            let vertical: usize = 1 if one else c.vertical
+            let base = c.coefficients.data
+            for y in 0..<vertical:
+                for x in 0..<horizontal:
+                    let block = ((my * vertical + y) * c.bx + mx * horizontal + x) * 64
+                    try sequential_block(b, dc, ac, &cursor.predictors[i], base + block)
+
+## One slice of a restart-split scan: whole intervals, decoded on a worker.
+struct IntervalJob:
+    var d: const Decoder*
+    var scan: const Scan*
+    ## Where each interval's data begins, and where its terminating marker is.
+    var starts: const usize[]
+    var stops: const usize[]
+    var first: usize
+    var last: usize
+    var failed: bool
+    var message: str
+
+func interval_task(context: void*, index: usize, scratch: Scratch*):
+    let jobs = (IntervalJob*)context
+    let job = &jobs[index]
+    let restart = job.d.restart
+    var b = Bits.over(job.d.data, job.starts[job.first])
+    let total = job.scan.across * job.scan.down
+    let last_mcu = total if job.last * restart > total else job.last * restart
+    var cursor = Cursor.at(job.d, job.first * restart)
+    sequential_range(job.d, job.scan, &b, &cursor, job.first * restart, last_mcu) catch failure:
+        job.failed = true
+        job.message = failure.message
+        return
+    if b.leftover() or b.pos != job.stops[job.last - 1]:
+        job.failed = true
+        job.message = "JPEG marker prefix missing"
+
+## Decode a sequential scan whose data starts at `reader`'s position; leave the
+## reader at the marker after it.
+func sequential_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
+    try check_tables(d, scan)
+    let total = scan.across * scan.down
+    if splits(d, scan):
+        if try parallel_intervals(d, scan, reader):
+            return
+    var b = Bits.over(d.data, reader.position)
+    var cursor = Cursor.at(d, 0)
+    try sequential_range(d, scan, &b, &cursor, 0, total)
+    if b.leftover():
+        error(corrupt, "JPEG marker prefix missing")
+    reader.position = b.pos
+
+func check_tables(d: const Decoder*, scan: const Scan*) -> !:
+    for i in 0..<scan.count:
+        let c = &d.components[scan.selected[i]]
+        if not d.tables[c.dc].present or not d.tables[c.ac + 4].present:
+            error(corrupt, "JPEG Huffman table missing")
+
+## Whether a sequential scan has enough restart intervals to split across threads.
+func splits(d: const Decoder*, scan: const Scan*) -> bool:
+    return d.threads > 1 and d.restart > 0 and scan.across * scan.down > d.restart * 2
+
+## Decode a restart-coded scan on every processor. False, having done nothing,
+## when the markers are not where the restart interval says: the sequential
+## decode then reports the fault exactly.
+func parallel_intervals(d: Decoder*, scan: const Scan*, reader: Reader*) -> bool!:
+    let total = scan.across * scan.down
+    let intervals = (total + d.restart - 1) // d.restart
+    let threads = d.threads
+    let starts = try new usize[intervals] in memory.heap
+    defer free(starts) in memory.heap
+    let stops = try new usize[intervals] in memory.heap
+    defer free(stops) in memory.heap
+    # Find each interval's marker: FF then D0..D7 in turn; FF 00 is a data byte.
+    let data = d.data.data
+    let end = d.data.length
+    var at = reader.position
+    var found: usize = 0
+    starts[0] = at
+    while at < end:
+        if data[at] != 255:
+            at += 1
+            continue
+        var next = at + 1
+        while next < end and data[next] == 255:
+            next += 1
+        if next >= end:
+            return false
+        let code = data[next]
+        if code == 0:
+            at = next + 1
+            continue
+        stops[found] = at
+        found += 1
+        if code < 208 or code > 215:
+            break
+        if found >= intervals or (usize)code != 208 + (found - 1) % 8:
+            return false
+        starts[found] = next + 1
+        at = next + 1
+    if found != intervals:
+        return false
+    # A few slices a thread balances uneven intervals.
+    let slices = intervals if intervals < threads * 4 else threads * 4
+    let jobs = try alloc IntervalJob[slices] in memory.heap
+    defer free(jobs) in memory.heap
+    for s in 0..<slices:
+        jobs[s] = IntervalJob(d = d, scan = scan, starts = starts, stops = stops, first = s * intervals // slices, last = (s + 1) * intervals // slices, failed = false, message = "")
+    try run_tasks(interval_task, (void*)jobs.data, slices, threads, 0)
+    for s in 0..<slices:
+        if jobs[s].failed:
+            error(corrupt, jobs[s].message)
+    reader.position = stops[intervals - 1]
+    return true

@@ -1,12 +1,138 @@
 #!/usr/bin/env python3
-"""Build and run luce-jpeg's test blocks in native and C modes."""
-import os, subprocess
+"""luce-jpeg's gate: the module's test blocks, then the decoder drivers in native
+and C modes against the fixtures:
+
+- every fixture decodes through the Raster API to exactly the samples of the
+  reference float decoder built the same way (tests/fixtures/golden.txt);
+- decode_rgb8, decode_rgba8 and decode_rows give those same samples, on one
+  thread and on several;
+- scaled decodes (1/2, 1/4, 1/8) have the scaled size, and with Pillow present
+  stay within 4 of libjpeg's reduced decodes, as full-size decodes stay within 4
+  of libjpeg's (except 3:1 and 4:1 sampling, which libjpeg replicates);
+- truncated and corrupted files fail cleanly, never crash or hang.
+"""
+import hashlib, os, random, struct, subprocess, sys, tempfile
 from pathlib import Path
+
 ROOT = Path(__file__).resolve().parents[1]
-BASE = ROOT.parent / "luce-base/build/luce-base"
+BASE = (ROOT.parent / "luce-base/build/luce-base").resolve()
 MODES = [["--native"], ["--backend=c"]]
-env = dict(os.environ, LUCE_BASE=str(BASE.resolve()), LUCE_STD=str((ROOT.parent / "luce-base/src/std").resolve()))
-for source in ["src/luce_jpeg/jpeg.lucb"]:
-    for flags in MODES:
-        subprocess.run([str(BASE.resolve()), "test", str(ROOT / source), *flags], env=env, check=True, timeout=300, cwd=ROOT)
+env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=str((ROOT.parent / "luce-base/src/std").resolve()))
+FIXTURES = sorted((ROOT / "tests/fixtures").glob("*.jpg"))
+GOLDEN = {}
+for line in (ROOT / "tests/fixtures/golden.txt").read_text().splitlines():
+    if line and not line.startswith("#"):
+        native, c, name = line.split("  ")
+        GOLDEN[name] = {"--native": native, "--backend=c": c}
+# libjpeg replicates 3:1 and 4:1 chroma where this decoder interpolates.
+REPLICATED = {"s32.jpg", "s411.jpg"}
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+
+def run(command, **options):
+    return subprocess.run([str(x) for x in command], env=env, cwd=ROOT, timeout=300, **options)
+
+
+def fail(message):
+    raise SystemExit(f"FAIL {message}")
+
+
+def read_raw(path):
+    data = path.read_bytes()
+    width, height, channels = struct.unpack_from("<III", data)
+    return width, height, channels, data[12:]
+
+
+def as_rgb(channels, pixels):
+    """Samples as RGB triples: gray repeated, alpha dropped."""
+    if channels == 3:
+        return pixels
+    if channels == 1:
+        return bytes(v for v in pixels for _ in range(3))
+    return bytes(b for i, b in enumerate(pixels) if i % 4 != 3)
+
+
+def reference(path, scale):
+    with Image.open(path) as image:
+        width, height = image.size
+        if scale > 1:
+            image.draft(image.mode, (max(1, width // scale), max(1, height // scale)))
+        return image.size, image.convert("RGB").tobytes()
+
+
+def check_drivers(tmp, flags):
+    dump, scaled = tmp / "dump", tmp / "scaled"
+    run([BASE, "build", ROOT / "tests/dump.lucb", *flags, "-o", dump], check=True)
+    run([BASE, "build", ROOT / "tests/scaled.lucb", *flags, "-o", scaled], check=True)
+    raw, out = tmp / "raw", tmp / "out"
+    compared = 0
+    for fixture in FIXTURES:
+        name = fixture.name
+        if run([dump, fixture, raw]).returncode != 0:
+            fail(f"{name}: the Raster decode failed")
+        if hashlib.sha256(raw.read_bytes()).hexdigest() != GOLDEN[name][flags[0]]:
+            fail(f"{name}: Raster samples differ from the reference decoder")
+        width, height, channels, samples = read_raw(raw)
+        expected = as_rgb(channels, samples)
+        for mode, threads in [("rgb", 1), ("rgba", 0), ("rows", 0), ("rgb", 3)]:
+            if run([scaled, fixture, out, 1, mode, threads]).returncode != 0:
+                fail(f"{name}: {mode} decode on {threads} threads failed")
+            w, h, pixel, pixels = read_raw(out)
+            if (w, h) != (width, height) or as_rgb(pixel, pixels) != expected:
+                fail(f"{name}: {mode} on {threads} threads differs from the Raster decode")
+            if mode == "rgba" and any(pixels[i] != 255 for i in range(3, len(pixels), 4)):
+                fail(f"{name}: alpha is not opaque")
+        if Image and name not in REPLICATED:
+            size, ref = reference(fixture, 1)
+            worst = max(abs(a - b) for a, b in zip(ref, expected))
+            if worst > 4:
+                fail(f"{name}: differs from libjpeg by {worst}")
+        for scale in [2, 4, 8]:
+            if run([scaled, fixture, out, scale, "rgb"]).returncode != 0:
+                fail(f"{name}: 1/{scale} decode failed")
+            w, h, pixel, pixels = read_raw(out)
+            if (w, h) != (-(-width // scale), -(-height // scale)):
+                fail(f"{name}: 1/{scale} decode is {w}x{h}")
+            if run([scaled, fixture, out, scale, "rows", 2]).returncode != 0 or read_raw(out)[3] != pixels:
+                fail(f"{name}: 1/{scale} rows differ from decode_rgb8")
+            if Image:
+                size, ref = reference(fixture, scale)
+                # Pillow's draft cannot ask for every ceil-rounded size of tiny pictures.
+                if size == (w, h):
+                    worst = max(abs(a - b) for a, b in zip(ref, pixels))
+                    if worst > 4:
+                        fail(f"{name}: 1/{scale} differs from libjpeg by {worst}")
+                    compared += 1
+    print(f"ok    {len(FIXTURES)} fixtures identical to the reference decoder through every API"
+          + (f"; {compared} scaled decodes within 4 of libjpeg" if Image else "; Pillow absent, libjpeg comparisons skipped"))
+    # Damaged files: every truncation point of a few fixtures and random byte
+    # changes must end in a clean error or a decode, never a crash or a hang.
+    rng = random.Random(7)
+    damaged = 0
+    for name in ["b420_37x35.jpg", "p420_37x35.jpg", "restart420.jpg", "mt_b420.jpg", "mt_restart.jpg", "mt_p420.jpg"]:
+        data = (ROOT / "tests/fixtures" / name).read_bytes()
+        cases = [data[:n] for n in range(2, len(data), max(1, len(data) // 60))]
+        for _ in range(40):
+            changed = bytearray(data)
+            for _ in range(rng.randrange(1, 4)):
+                changed[rng.randrange(2, len(changed))] = rng.randrange(256)
+            cases.append(bytes(changed))
+        for case in cases:
+            (tmp / "bad.jpg").write_bytes(case)
+            for command in [[dump, tmp / "bad.jpg", raw], [scaled, tmp / "bad.jpg", out, 1, "rgba"], [scaled, tmp / "bad.jpg", out, 2, "rows"]]:
+                result = run(command, capture_output=True)
+                if result.returncode not in (0, 1):
+                    fail(f"{name}: a damaged file ended the process with {result.returncode}")
+                damaged += 1
+    print(f"ok    {damaged} decodes of damaged files ended cleanly")
+
+
+for flags in MODES:
+    run([BASE, "test", ROOT / "src/luce_jpeg/jpeg", *flags], check=True)
+    with tempfile.TemporaryDirectory(prefix="luce-jpeg-") as tmp:
+        check_drivers(Path(tmp), flags)
 print("PASS luce-jpeg")

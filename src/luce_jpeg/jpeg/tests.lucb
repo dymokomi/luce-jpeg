@@ -1,0 +1,184 @@
+#==============================================================================================
+#
+#   jpeg/tests - The module's tests
+#
+#   DESCRIPTION:
+#       Small pictures made by the module's own encoder, through every decoding API.
+#       tests/run.py covers files from other encoders, threads, sampling factors,
+#       progressive coding, restart markers and damaged data.
+#
+#==============================================================================================
+
+## A width x height RGB (or gray) test picture: gradients and a hard edge, encoded.
+func test_picture(encoded: Buffer*, width: usize, height: usize, channels: usize) -> !:
+    var raster = Raster()
+    defer raster.close()
+    raster.width = width
+    raster.height = height
+    try raster.standard(channels, .uint8)
+    try raster.allocate()
+    for y in 0..<height:
+        for x in 0..<width:
+            for c in 0..<channels:
+                let edge: usize = 90 if x * 3 > width * 2 else 0
+                raster.pixels[(y * width + x) * channels + c] = (f64)((x * 255 // width + y * 7 * (c + 1) + edge) % 256)
+    try encode(&raster, encoded, quality = 90)
+
+## The Raster decode of `data`: its f64 samples as bytes, and the channel count.
+func raster_samples(data: u8[], out: u8[]) -> usize!:
+    var raster = Raster()
+    raster.encoded = data
+    let channels = raster_decode(&raster, out) catch failure:
+        var empty: u8[]
+        raster.encoded = empty
+        raster.close()
+        error(failure.code, failure.message)
+    var empty: u8[]
+    raster.encoded = empty
+    raster.close()
+    return channels
+
+func raster_decode(raster: Raster*, out: u8[]) -> usize!:
+    try probe(raster)
+    try raster.allocate()
+    try decode(raster)
+    for i in 0..<raster.pixels.length:
+        out[i] = (u8)raster.pixels[i]
+    return raster.channels.length
+
+test "info reads the frame header and rounds scaled sizes up":
+    var encoded = Buffer()
+    defer encoded.close()
+    try test_picture(&encoded, 21, 10, 3)
+    let found = try info(encoded.view())
+    assert(found.width == 21 and found.height == 10 and found.components == 3 and not found.progressive)
+    assert(found.scaled_width(2) == 11 and found.scaled_height(4) == 3 and found.scaled_width(8) == 3 and found.scaled_height(8) == 2)
+
+test "8-bit output matches the Raster samples":
+    var encoded = Buffer()
+    defer encoded.close()
+    try test_picture(&encoded, 23, 17, 3)
+    var samples: u8[1173]
+    assert(try raster_samples(encoded.data[..<encoded.used], samples) == 3)
+    var rgb: u8[1173]
+    try decode_rgb8(encoded.view(), rgb)
+    var rgba: u8[1564]
+    try decode_rgba8(encoded.view(), rgba)
+    for i in 0..<(usize)391:
+        for c in 0..<(usize)3:
+            assert(rgb[i * 3 + c] == samples[i * 3 + c])
+            assert(rgba[i * 4 + c] == samples[i * 3 + c])
+        assert(rgba[i * 4 + 3] == 255)
+
+test "grayscale repeats into RGB":
+    var encoded = Buffer()
+    defer encoded.close()
+    try test_picture(&encoded, 9, 9, 1)
+    var samples: u8[81]
+    assert(try raster_samples(encoded.data[..<encoded.used], samples) == 1)
+    var rgba: u8[324]
+    try decode_rgba8(encoded.view(), rgba)
+    for i in 0..<(usize)81:
+        assert(rgba[i * 4] == samples[i] and rgba[i * 4 + 1] == samples[i] and rgba[i * 4 + 2] == samples[i] and rgba[i * 4 + 3] == 255)
+
+struct Rows:
+    var bytes: u8[1564]
+    var next: usize
+    var calls: usize
+
+func collect_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    let into = (Rows*)(context else return)
+    if first != into.next or bytes.length != rows * 23 * 4:
+        error(invalid, "rows out of order")
+    for i in 0..<bytes.length:
+        into.bytes[first * 23 * 4 + i] = bytes[i]
+    into.next = first + rows
+    into.calls += 1
+
+func refuse_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    error(limit, "the sink is full")
+
+test "row callbacks deliver every row in order":
+    var encoded = Buffer()
+    defer encoded.close()
+    try test_picture(&encoded, 23, 17, 3)
+    var whole: u8[1564]
+    try decode_rgba8(encoded.view(), whole)
+    var rows = Rows()
+    try decode_rows(encoded.view(), collect_rows, (void*)&rows)
+    assert(rows.next == 17 and rows.calls >= 1)
+    for i in 0..<whole.length:
+        assert(rows.bytes[i] == whole[i])
+    var failed = false
+    decode_rows(encoded.view(), refuse_rows, none) catch failure:
+        failed = failure.code == limit
+        recover ()
+    assert(failed)
+
+test "scaled decodes have the scaled size and keep a flat colour":
+    var raster = Raster()
+    defer raster.close()
+    raster.width = 40
+    raster.height = 24
+    try raster.standard(3, .uint8)
+    try raster.allocate()
+    for i in 0..<raster.pixels.length:
+        raster.pixels[i] = 200.0 if i % 3 == 0 else 60.0 if i % 3 == 1 else 120.0
+    var encoded = Buffer()
+    defer encoded.close()
+    try encode(&raster, &encoded, quality = 95)
+    let scales: usize[3] = [2, 4, 8]
+    for scale in scales:
+        let width = (40 + scale - 1) // scale
+        let height = (24 + scale - 1) // scale
+        var out: u8[960]
+        try decode_rgb8(encoded.view(), out[..<width * height * 3], Options(scale = scale))
+        for i in 0..<width * height:
+            assert(out[i * 3] >= 198 and out[i * 3] <= 202)
+            assert(out[i * 3 + 1] >= 58 and out[i * 3 + 1] <= 62)
+            assert(out[i * 3 + 2] >= 118 and out[i * 3 + 2] <= 122)
+
+test "a scaled decode averages the full-size one":
+    var encoded = Buffer()
+    defer encoded.close()
+    try test_picture(&encoded, 32, 16, 1)
+    var full: u8[1536]
+    try decode_rgb8(encoded.view(), full)
+    var half: u8[384]
+    try decode_rgb8(encoded.view(), half, Options(scale = 2))
+    # Each half-size pixel is the mean of its 2x2 full-size pixels before rounding,
+    # so within one of the mean of the rounded ones.
+    for y in 0..<(usize)8:
+        for x in 0..<(usize)16:
+            let sum = (i64)full[((2 * y) * 32 + 2 * x) * 3] + (i64)full[((2 * y) * 32 + 2 * x + 1) * 3] + (i64)full[((2 * y + 1) * 32 + 2 * x) * 3] + (i64)full[((2 * y + 1) * 32 + 2 * x + 1) * 3]
+            let difference = (i64)half[(y * 16 + x) * 3] * 4 - sum
+            assert(difference >= -6 and difference <= 6)
+
+test "bad requests and bad data fail cleanly":
+    var encoded = Buffer()
+    defer encoded.close()
+    try test_picture(&encoded, 16, 8, 3)
+    var out: u8[512]
+    var refused = false
+    decode_rgba8(encoded.view(), out, Options(scale = 3)) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    refused = false
+    decode_rgba8(encoded.view(), out[..<100]) catch failure:
+        refused = failure.code == invalid
+        recover ()
+    assert(refused)
+    let data = encoded.view()
+    let cuts: usize[5] = [2, 20, 200, data.length - 40, data.length - 2]
+    for cut in cuts:
+        refused = false
+        decode_rgba8(data[..<cut], out) catch failure:
+            refused = failure.code == corrupt
+            recover ()
+        assert(refused)
+    refused = false
+    discard(info(b"not a jpeg at all") catch failure:
+        refused = failure.code == corrupt
+        recover Info(width = 0, height = 0, components = 0, progressive = false))
+    assert(refused)

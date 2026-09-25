@@ -1,0 +1,201 @@
+#==============================================================================================
+#
+#   jpeg/huffman - Huffman tables with 11-bit lookahead, and the 64-bit bit reader
+#
+#   DESCRIPTION:
+#       A code of up to eleven bits decodes with one table lookup on the next eleven bits.
+#       For AC tables a second lookup also covers the coefficient's magnitude bits when
+#       code and magnitude together fit in eleven bits, which is most coefficients of a
+#       photograph: run, value and total length come from one load. Longer codes fall
+#       back to the canonical maxcode walk.
+#
+#==============================================================================================
+
+let lookahead: u32 = 11
+## Lookup entries, 2^lookahead, and the shift that leaves the top lookahead bits.
+let entries: usize = 2048
+let peek: u64 = 53
+
+struct Huffman:
+    ## The next eleven bits: (code length << 8) | symbol, or 0 for a longer code.
+    var lookup: u16[entries]
+    ## AC tables, the next eleven bits: (value << 16) | (run << 8) | bits used by code
+    ## and magnitude together, or 0 when they do not fit or the symbol has no value.
+    var fast_ac: i32[entries]
+    ## The largest code of each length, -1 for none.
+    var maxcode: i32[18]
+    ## Index of a length's first symbol, less its first code.
+    var offset: i32[17]
+    var symbols: u8[256]
+    var present: bool
+
+## Build `table` from a DHT segment's code counts and symbols; the counts are
+## already checked not to oversubscribe the code space.
+func build_huffman(table: Huffman*, counts: const u32[17], values: const u8[]):
+    *table = Huffman()
+    var code: i32 = 0
+    var k: usize = 0
+    for length in 1..<(usize)17:
+        table.offset[length] = (i32)k - code
+        for i in 0..<(usize)counts[length]:
+            table.symbols[k] = values[k]
+            if length <= (usize)lookahead:
+                let shift = lookahead - (u32)length
+                let first = (usize)code << shift
+                for fill in 0..<((usize)1 << shift):
+                    table.lookup[first + fill] = (u16)((length << 8) | (usize)values[k])
+            code += 1
+            k += 1
+        table.maxcode[length] = code - 1 if counts[length] > 0 else -1
+        code <<= 1
+    table.maxcode[17] = 2147483647
+    for prefix in 0..<entries:
+        let entry = (u32)table.lookup[prefix]
+        if entry == 0:
+            continue
+        let length = entry >> 8
+        let run = (entry >> 4) & 15
+        let size = entry & 15
+        if size == 0 or length + size > lookahead:
+            continue
+        let bits = ((u32)prefix >> (lookahead - length - size)) & (((u32)1 << size) - 1)
+        let value = extend(bits, size)
+        table.fast_ac[prefix] = (value << 16) | (i32)(run << 8) | (i32)(length + size)
+    table.present = true
+
+## The signed value of `size` magnitude bits.
+inline func extend(bits: u32, size: u32) -> i32:
+    return (i32)bits if bits >= ((u32)1 << (size -% 1)) else (i32)bits +% 1 -% ((i32)1 << size)
+
+## A code longer than eleven bits, from the top of `acc`: (length, symbol), or length 0
+## when no code matches.
+func slow_symbol(table: const Huffman*, acc: u64) -> (u32, u32):
+    var length: u32 = lookahead + 1
+    var code = (i32)(acc >> (64 - length))
+    while length <= 16 and code > table.maxcode[(usize)length]:
+        length += 1
+        code = (i32)(acc >> (64 - length))
+    if length > 16:
+        return (0, 0)
+    return (length, (u32)table.symbols[(usize)(table.offset[(usize)length] + code)])
+
+## Entropy-coded data as a stream of bits, most significant first, read 64 bits
+## ahead. Stuffed zero bytes are removed. At a marker or the end of the data the
+## reader supplies zero bits and counts them in `padded`; reading into them is
+## corrupt data, checked after each block.
+struct Bits:
+    var data: const u8*
+    var end: usize
+    var pos: usize
+    ## Unread bits at the top; `bits` of them are valid, the last `padded` are fill.
+    var acc: u64
+    var bits: u32
+    var padded: u32
+
+    static func over(data: const u8[], position: usize) -> Bits:
+        return Bits(data = data.data, end = data.length, pos = position, acc = 0, bits = 0, padded = 0)
+
+    ## Top up to at least 57 bits.
+    mutating func fill():
+        var acc = self.acc
+        var bits = self.bits
+        let data = self.data
+        var pos = self.pos
+        # Eight bytes at once while none of them is 0xFF (a stuffed byte or marker).
+        if bits <= 56 and pos + 8 <= self.end:
+            let p = data + pos
+            let word = ((u64)p[0] << 56) | ((u64)p[1] << 48) | ((u64)p[2] << 40) | ((u64)p[3] << 32) | ((u64)p[4] << 24) | ((u64)p[5] << 16) | ((u64)p[6] << 8) | (u64)p[7]
+            if ((~word -% 0x0101010101010101) & word & 0x8080808080808080) == 0:
+                let count = (64 - bits) >> 3
+                let taken = 8 * count
+                acc |= (word >> (64 - taken)) << (64 - taken - bits)
+                self.acc = acc
+                self.bits = bits + taken
+                self.pos = pos + (usize)count
+                return
+        while bits <= 56:
+            var byte: u64 = 0
+            if pos < self.end:
+                let value = data[pos]
+                if value != 255:
+                    byte = (u64)value
+                    pos += 1
+                elif pos + 1 < self.end and data[pos + 1] == 0:
+                    byte = 255
+                    pos += 2
+                else:
+                    self.padded += 8
+            else:
+                self.padded += 8
+            acc |= byte << (56 - bits)
+            bits += 8
+        self.acc = acc
+        self.bits = bits
+        self.pos = pos
+
+    ## `count` bits (1 through 16) as an unsigned value.
+    mutating func take(count: u32) -> u32:
+        if self.bits < count:
+            self.fill()
+        let value = (u32)(self.acc >> (64 - count))
+        self.acc <<= count
+        self.bits -= count
+        return value
+
+    ## One bit.
+    mutating func bit() -> u32:
+        if self.bits == 0:
+            self.fill()
+        let value = (u32)(self.acc >> 63)
+        self.acc <<= 1
+        self.bits -= 1
+        return value
+
+    ## The next Huffman symbol from `table`.
+    mutating func symbol(table: const Huffman*) -> u32!:
+        if self.bits < 16:
+            self.fill()
+        let entry = (u32)table.lookup[(usize)(self.acc >> peek)]
+        if entry != 0:
+            let length = entry >> 8
+            self.acc <<= length
+            self.bits -= length
+            return entry & 255
+        let (length, value) = slow_symbol(table, self.acc)
+        if length == 0:
+            error(corrupt, "invalid JPEG Huffman code")
+        self.acc <<= length
+        self.bits -= length
+        return value
+
+    ## Whether the last read went past the data into fill bits.
+    func overrun() -> bool:
+        return self.bits < self.padded
+
+    ## Whether whole bytes of data were read ahead and left unconsumed: the scan or
+    ## restart interval ended before its data did.
+    func leftover() -> bool:
+        return self.bits >= self.padded + 8
+
+    ## Past the restart marker `expected` (208..215) at the reader's position, with
+    ## the bit buffer emptied.
+    mutating func restart(expected: u8) -> !:
+        if self.leftover():
+            error(corrupt, "JPEG marker prefix missing")
+        if self.pos >= self.end or self.data[self.pos] != 255:
+            error(corrupt, "JPEG marker prefix missing")
+        var at = self.pos + 1
+        while at < self.end and self.data[at] == 255:
+            at += 1
+        if at >= self.end:
+            error(corrupt, "JPEG restart marker missing")
+        if self.data[at] != expected:
+            error(corrupt, "JPEG restart marker mismatch")
+        self.pos = at + 1
+        self.acc = 0
+        self.bits = 0
+        self.padded = 0
+
+## The next restart marker after `marker` (208..215).
+func next_restart(code: u8) -> u8:
+    return 208 if code == 215 else code + 1

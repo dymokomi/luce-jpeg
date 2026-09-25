@@ -1,0 +1,156 @@
+#==============================================================================================
+#
+#   jpeg/color - Upsampling and colour conversion of one output row
+#
+#   DESCRIPTION:
+#       A component sample at an output pixel is the bilinear interpolation of its
+#       plane at the pixel's centre, (x + 0.5) * num/den - 0.5, clamped to the samples
+#       that cover the picture: libjpeg's "fancy" triangle filter for 2:1 subsampling.
+#       Colour conversion is the JFIF YCbCr matrix in f64 (or Adobe's RGB, CMYK and
+#       YCCK), rounded to the nearest 8-bit value.
+#
+#       For the common 1:1 and 2:1 ratios every weight is a multiple of 1/4, so the
+#       interpolation is exact in integers (sixteenths); other ratios take the f64
+#       path. Both give the same values. Scaled decodes repeat samples where libjpeg
+#       does (1/8, and ratios other than 2:1).
+#
+#==============================================================================================
+
+## Component `c` at output row `y`, pixels 0..<`width`, into `row`. `column` is
+## scratch for a vertically interpolated plane row, at least the plane's stride.
+func component_row(c: const Component*, y: usize, width: usize, row: f64*, column: i32*):
+    if c.replicate:
+        let line = c.plane.data + y * c.num_y // c.den_y * c.stride
+        for x in 0..<width:
+            row[x] = (f64)line[x * c.num_x // c.den_x]
+        return
+    let fast_x = c.num_x == c.den_x or c.num_x * 2 == c.den_x
+    let fast_y = c.num_y == c.den_y or c.num_y * 2 == c.den_y
+    if not fast_x or not fast_y:
+        for x in 0..<width:
+            row[x] = interpolate(c, x, y)
+        return
+    # Vertical: the two plane rows and the second one's weight in quarters.
+    var r0 = y
+    var fy: i32 = 0
+    if c.num_y != c.den_y:
+        let s = clamp_quarter(y, c.valid_h)
+        r0 = s >> 2
+        fy = (i32)(s & 3)
+    let r1 = r0 + 1 if r0 + 1 < c.rows else r0
+    let p0 = c.plane.data + r0 * c.stride
+    let p1 = c.plane.data + r1 * c.stride
+    if c.num_x == c.den_x:
+        if fy == 0:
+            for x in 0..<width:
+                row[x] = (f64)p0[x]
+        else:
+            for x in 0..<width:
+                row[x] = (f64)((i32)p0[x] * (4 - fy) + (i32)p1[x] * fy) * 0.25
+        return
+    let valid = c.valid_w
+    let needed = valid + 1 if valid < c.stride else c.stride
+    for i in 0..<needed:
+        column[i] = (i32)p0[i] * (4 - fy) + (i32)p1[i] * fy
+    # Output x samples at (2x - 1) / 4: x = 0 at the first sample, then pairs
+    # 3/4 and 1/4 either side of each boundary, then the last sample repeated.
+    row[0] = (f64)(column[0] * 4) * 0.0625
+    var x: usize = 1
+    for j in 0..<valid - 1:
+        let a = column[j]
+        let b = column[j + 1]
+        row[x] = (f64)(a * 3 + b) * 0.0625
+        row[x + 1] = (f64)(a + b * 3) * 0.0625
+        x += 2
+    let last = (f64)(column[valid - 1] * 4) * 0.0625
+    while x < width:
+        row[x] = last
+        x += 1
+
+## 2:1 upsampling's source position of output `x` in quarter samples,
+## 2x - 1 clamped to 0..4 * (valid - 1).
+inline func clamp_quarter(x: usize, valid: usize) -> usize:
+    if x == 0:
+        return 0
+    let s = 2 * x - 1
+    let last = 4 * (valid - 1)
+    return s if s < last else last
+
+## The general bilinear sample of `c` at output pixel (x, y).
+func interpolate(c: const Component*, x: usize, y: usize) -> f64:
+    let sx = math.clamp(((f64)x + 0.5) * (f64)c.num_x / (f64)c.den_x - 0.5, 0.0, (f64)(c.valid_w - 1))
+    let sy = math.clamp(((f64)y + 0.5) * (f64)c.num_y / (f64)c.den_y - 0.5, 0.0, (f64)(c.valid_h - 1))
+    let x0 = (usize)math.floor(sx)
+    let y0 = (usize)math.floor(sy)
+    let x1 = x0 + 1 if x0 + 1 < c.stride else x0
+    let y1 = y0 + 1 if y0 + 1 < c.rows else y0
+    let fx = sx - (f64)x0
+    let fy = sy - (f64)y0
+    let p = c.plane.data
+    let a = (f64)p[y0 * c.stride + x0] * (1.0 - fx) + (f64)p[y0 * c.stride + x1] * fx
+    let b = (f64)p[y1 * c.stride + x0] * (1.0 - fx) + (f64)p[y1 * c.stride + x1] * fx
+    return a * (1.0 - fy) + b * fy
+
+## Rounded to the nearest 8-bit value: floor(clamp(v, 0, 255) + 0.5).
+inline func round8(v: f64) -> u8:
+    return floor8(v + 0.5)
+
+## Convert one row of component samples (`rows`, one row of `width` after another)
+## to pixels of `step` bytes at `out`: 1 gray, 3 RGB, or 4 RGB with alpha 255.
+func convert_row(d: const Decoder*, rows: const f64*, width: usize, out: u8*, step: usize):
+    let ya = rows
+    if d.count == 1:
+        for x in 0..<width:
+            let v = round8(ya[x])
+            out[x * step] = v
+            if step > 1:
+                out[x * step + 1] = v
+                out[x * step + 2] = v
+        if step == 4:
+            for x in 0..<width:
+                out[x * 4 + 3] = 255
+        return
+    let cb = rows + width
+    let cr = rows + 2 * width
+    let direct = d.adobe == 0 or (d.count == 3 and d.components[0].id == 'R' and d.components[1].id == 'G' and d.components[2].id == 'B')
+    if d.count == 3 and direct:
+        for x in 0..<width:
+            out[x * step] = round8(ya[x])
+            out[x * step + 1] = round8(cb[x])
+            out[x * step + 2] = round8(cr[x])
+    elif d.count == 3:
+        for x in 0..<width:
+            let a = ya[x]
+            let b = cb[x]
+            let c = cr[x]
+            out[x * step] = round8(a + 1.402 * (c - 128.0))
+            out[x * step + 1] = round8(a - 0.344136 * (b - 128.0) - 0.714136 * (c - 128.0))
+            out[x * step + 2] = round8(a + 1.772 * (b - 128.0))
+    else:
+        let k = rows + 3 * width
+        for x in 0..<width:
+            let a = ya[x]
+            let b = cb[x]
+            let c = cr[x]
+            let black = k[x]
+            var red = a if direct else a + 1.402 * (c - 128.0)
+            var green = b if direct else a - 0.344136 * (b - 128.0) - 0.714136 * (c - 128.0)
+            var blue = c if direct else a + 1.772 * (b - 128.0)
+            if d.adobe == 2:
+                red = (255.0 - math.clamp(red, 0.0, 255.0)) * black / 255.0
+                green = (255.0 - math.clamp(green, 0.0, 255.0)) * black / 255.0
+                blue = (255.0 - math.clamp(blue, 0.0, 255.0)) * black / 255.0
+            elif d.adobe == 0:
+                red = a * black / 255.0
+                green = b * black / 255.0
+                blue = c * black / 255.0
+            else:
+                red = (255.0 - a) * (255.0 - black) / 255.0
+                green = (255.0 - b) * (255.0 - black) / 255.0
+                blue = (255.0 - c) * (255.0 - black) / 255.0
+            out[x * step] = round8(red)
+            out[x * step + 1] = round8(green)
+            out[x * step + 2] = round8(blue)
+    if step == 4:
+        for x in 0..<width:
+            out[x * 4 + 3] = 255

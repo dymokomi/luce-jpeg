@@ -1,0 +1,271 @@
+#==============================================================================================
+#
+#   jpeg/progressive - Spectral selection and successive approximation scans
+#
+#   DESCRIPTION:
+#       Each progressive scan adds a band of coefficients (first scans) or one more bit
+#       of precision to them (refinement scans) for one component, or DC for several.
+#       Scans depend on each other bit by bit, so they decode in order on the calling
+#       thread; rendering afterwards is parallel.
+#
+#==============================================================================================
+
+## The state a progressive scan carries from block to block.
+struct Progress:
+    var eob: usize
+
+func dc_first(b: Bits*, table: const Huffman*, predictor: i32*, block: i16*, al: u32) -> !:
+    let size = try b.symbol(table)
+    if size > 11:
+        error(corrupt, "JPEG DC difference too large")
+    let diff = extend(b.take(size), size) if size > 0 else 0
+    let value = *predictor + diff
+    if value < -32768 or value > 32767:
+        error(corrupt, "JPEG DC predictor out of range")
+    *predictor = value
+    block[0] = (i16)(value << al)
+
+func dc_refine(b: Bits*, block: i16*, al: u32):
+    block[0] = (i16)((i32)block[0] | ((i32)b.bit() << al))
+
+func ac_first(b: Bits*, table: const Huffman*, block: i16*, nonzero: u64*, ss: usize, se: usize, al: u32, state: Progress*) -> !:
+    if state.eob > 0:
+        state.eob -= 1
+        return
+    let order = &zigzag[0]
+    let fast = &table.fast_ac[0]
+    let lookup = &table.lookup[0]
+    var acc = b.acc
+    var bits = b.bits
+    var k = ss
+    while k <= se:
+        if bits < 32:
+            b.acc = acc
+            b.bits = bits
+            b.fill()
+            acc = b.acc
+            bits = b.bits
+        let look = (usize)(acc >> peek)
+        let hit = fast[look]
+        if hit != 0:
+            # Run, value and length from one lookup.
+            k = k +% (usize)((hit >> 8) & 15)
+            let used = (u32)(hit & 255)
+            acc <<= used
+            bits = bits -% used
+            if k > se:
+                error(corrupt, "JPEG AC run exceeds spectral band")
+            block[order[k]] = (i16)((hit >> 16) << al)
+            *nonzero |= (u64)1 << (u64)k
+            k = k +% 1
+            continue
+        var symbol: u32 = 0
+        let found = (u32)lookup[look]
+        if found != 0:
+            symbol = found & 255
+            acc <<= found >> 8
+            bits = bits -% (found >> 8)
+        else:
+            let (length, value) = slow_symbol(table, acc)
+            if length == 0:
+                error(corrupt, "invalid JPEG Huffman code")
+            symbol = value
+            acc <<= length
+            bits = bits -% length
+        let run = (usize)(symbol >> 4)
+        let size = symbol & 15
+        if size == 0:
+            if run == 15:
+                k = k +% 16
+                if k > se + 1:
+                    error(corrupt, "JPEG zero run exceeds spectral band")
+                continue
+            # An end-of-band run: this block and 2^run - 1 + (run bits) more.
+            var extra: usize = 0
+            if run > 0:
+                extra = (usize)(acc >> (64 - (u64)run))
+                acc <<= (u64)run
+                bits = bits -% (u32)run
+            state.eob = ((usize)1 << run) + extra - 1
+            break
+        if size > 10:
+            error(corrupt, "JPEG AC coefficient too large")
+        k = k +% run
+        if k > se:
+            error(corrupt, "JPEG AC run exceeds spectral band")
+        block[order[k]] = (i16)(extend((u32)(acc >> (64 - size)), size) << al)
+        *nonzero |= (u64)1 << (u64)k
+        acc <<= size
+        bits = bits -% size
+        k = k +% 1
+    b.acc = acc
+    b.bits = bits
+
+## Refinement: every coefficient already nonzero gains one bit, and newly nonzero
+## ones (magnitude 1 << al) are placed at the zeros a run skips. `nonzero` is the
+## block's bitmap of nonzero coefficients by zigzag index, so the zeros counted
+## and the coefficients refined are found by bit arithmetic.
+func ac_refine(b: Bits*, table: const Huffman*, block: i16*, nonzero: u64*, ss: usize, se: usize, al: u32, state: Progress*) -> !:
+    let order = &zigzag[0]
+    let lookup = &table.lookup[0]
+    let plus = (i32)1 << al
+    let band = ((u64)0xFFFFFFFFFFFFFFFF << (u64)ss) & ((u64)0xFFFFFFFFFFFFFFFF >> (u64)(63 - se))
+    var acc = b.acc
+    var bits = b.bits
+    var k = ss
+    if state.eob == 0:
+        while k <= se:
+            if bits < 32:
+                b.acc = acc
+                b.bits = bits
+                b.fill()
+                acc = b.acc
+                bits = b.bits
+            var symbol: u32 = 0
+            let found = (u32)lookup[(usize)(acc >> peek)]
+            if found != 0:
+                symbol = found & 255
+                acc <<= found >> 8
+                bits = bits -% (found >> 8)
+            else:
+                let (length, value) = slow_symbol(table, acc)
+                if length == 0:
+                    error(corrupt, "invalid JPEG Huffman code")
+                symbol = value
+                acc <<= length
+                bits = bits -% length
+            let run = symbol >> 4
+            let size = symbol & 15
+            var new_value: i32 = 0
+            if size == 0:
+                if run != 15:
+                    var extra: usize = 0
+                    if run > 0:
+                        extra = (usize)(acc >> (64 - (u64)run))
+                        acc <<= (u64)run
+                        bits = bits -% run
+                    state.eob = ((usize)1 << (usize)run) + extra
+                    break
+            elif size == 1:
+                new_value = plus if acc >> 63 != 0 else -plus
+                acc <<= 1
+                bits = bits -% 1
+            else:
+                error(corrupt, "invalid progressive JPEG refinement")
+            # The zero the symbol lands on: after `run` zeros for a new value, the
+            # sixteenth for a zero run (which then continues just past it).
+            let here = band & ((u64)0xFFFFFFFFFFFFFFFF << (u64)k)
+            var zeros = ~*nonzero & here
+            var skip = run if new_value != 0 else 15
+            while skip > 0 and zeros != 0:
+                zeros &= zeros - 1
+                skip -= 1
+            if zeros == 0:
+                if new_value != 0:
+                    error(corrupt, "JPEG refinement exceeds spectral band")
+                error(corrupt, "JPEG refinement zero run exceeds band")
+            let at = lowest64(zeros)
+            # Refine the nonzero coefficients passed over on the way.
+            var passed = *nonzero & here & (((u64)1 << (u64)at) - 1)
+            while passed != 0:
+                let j = lowest64(passed)
+                passed &= passed - 1
+                if bits == 0:
+                    b.acc = acc
+                    b.bits = bits
+                    b.fill()
+                    acc = b.acc
+                    bits = b.bits
+                refine(block + order[j], (i32)(acc >> 63), plus)
+                acc <<= 1
+                bits = bits -% 1
+            if new_value != 0:
+                block[order[at]] = (i16)new_value
+                *nonzero |= (u64)1 << (u64)at
+            k = at + 1
+    if state.eob > 0:
+        # Inside an end-of-band run: only the nonzero coefficients gain a bit.
+        var passed = *nonzero & band & ((u64)0xFFFFFFFFFFFFFFFF << (u64)k) if k < 64 else 0
+        while passed != 0:
+            let j = lowest64(passed)
+            passed &= passed - 1
+            if bits == 0:
+                b.acc = acc
+                b.bits = bits
+                b.fill()
+                acc = b.acc
+                bits = b.bits
+            refine(block + order[j], (i32)(acc >> 63), plus)
+            acc <<= 1
+            bits = bits -% 1
+        state.eob -= 1
+    b.acc = acc
+    b.bits = bits
+
+## One correction bit for a nonzero coefficient: where it is set and the
+## coefficient's own bit at this position is not, the magnitude grows by `plus`.
+## Branch-free, since the bits are noise to a predictor.
+inline func refine(slot: i16*, bit: i32, plus: i32):
+    let value = (i32)*slot
+    let sign = value >> 31
+    let magnitude = (value ^ sign) -% sign
+    let grow = bit & (i32)((magnitude & plus) == 0)
+    *slot = (i16)(value +% (((plus ^ sign) -% sign) & -%grow))
+
+## The index of the lowest set bit of a nonzero word, by de Bruijn multiplication.
+inline func lowest64(x: u64) -> usize:
+    return (usize)debruijn[(usize)(((x & -%x) *% 0x03F79D71B4CB0A89) >> 58)]
+
+let debruijn: u8[64] = [0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29, 17, 4, 62, 55, 59, 36, 53, 51, 43, 22, 45, 39, 33, 30, 24, 18, 12, 5, 63, 47, 56, 27, 60, 41, 37, 16, 54, 35, 52, 21, 44, 32, 23, 11, 46, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6]
+
+## Decode a progressive scan whose data starts at `reader`'s position; leave the
+## reader at the marker after it.
+func progressive_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
+    let ss = scan.ss
+    let se = scan.se
+    let al = scan.al
+    let refining = scan.ah != 0
+    for i in 0..<scan.count:
+        let c = &d.components[scan.selected[i]]
+        if (ss == 0 and not refining and not d.tables[c.dc].present) or (ss > 0 and not d.tables[c.ac + 4].present):
+            error(corrupt, "JPEG Huffman table missing")
+    var b = Bits.over(d.data, reader.position)
+    var state = Progress()
+    var predictors: i32[4]
+    var expected: u8 = 208
+    let one = scan.count == 1
+    let total = scan.across * scan.down
+    for mcu in 0..<total:
+        if mcu > 0 and d.restart > 0 and mcu % d.restart == 0:
+            if state.eob != 0:
+                error(corrupt, "JPEG restart marker mismatch")
+            try b.restart(expected)
+            expected = next_restart(expected)
+            predictors = i32[4](0)
+        let mx = mcu % scan.across
+        let my = mcu // scan.across
+        for i in 0..<scan.count:
+            let c = &d.components[scan.selected[i]]
+            let horizontal: usize = 1 if one else c.horizontal
+            let vertical: usize = 1 if one else c.vertical
+            let base = c.coefficients.data
+            for y in 0..<vertical:
+                for x in 0..<horizontal:
+                    let index = (my * vertical + y) * c.bx + mx * horizontal + x
+                    let block = base + index * 64
+                    if ss == 0:
+                        if refining:
+                            dc_refine(&b, block, al)
+                        else:
+                            try dc_first(&b, &d.tables[c.dc], &predictors[i], block, al)
+                    elif refining:
+                        try ac_refine(&b, &d.tables[c.ac + 4], block, c.nonzero.data + index, ss, se, al, &state)
+                    else:
+                        try ac_first(&b, &d.tables[c.ac + 4], block, c.nonzero.data + index, ss, se, al, &state)
+                    if b.overrun():
+                        error(corrupt, "unexpected JPEG marker inside entropy data")
+    if state.eob != 0:
+        error(corrupt, "JPEG EOB run exceeds scan")
+    if b.leftover():
+        error(corrupt, "JPEG marker prefix missing")
+    reader.position = b.pos

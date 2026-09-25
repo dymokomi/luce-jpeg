@@ -1,0 +1,236 @@
+#==============================================================================================
+#
+#   jpeg/idct - The exact separable IDCT, full size and DCT-scaled
+#
+#   DESCRIPTION:
+#       The inverse DCT in f64, rows then columns, with exact cosines: at full size
+#       f(x) = sum_k c(k)/2 F(k) cos((2x+1)k pi/16), c(0) = 1/sqrt 2, rounded to the
+#       nearest sample and clamped. Zero coefficients and all-zero rows are skipped,
+#       which only omits additions of zero, so results do not depend on the skipping.
+#
+#       A scaled IDCT gives N < 8 points a block, each the mean of the 8 / N full-size
+#       points it covers before rounding: a box-filtered reduction, as libjpeg's
+#       reduced IDCTs compute in fixed point. Averaging the cosines first keeps it one
+#       separable transform of the same coefficients: N = 1 is the block's DC.
+#
+#==============================================================================================
+
+## Cosines for N = 1, 2, 4 and 8 points: table `level` (0..3, N = 1 << level)
+## holds c(k) times the mean of cos((2n+1)k pi/16) over the 8 / N full-size points
+## n that point x covers, at [level * 64 + x * 8 + k], and transposed at
+## [level * 64 + k * 8 + x] in `by_frequency`. N = 8 is the plain full-size table.
+struct Cosines:
+    var table: f64[256]
+    var by_frequency: f64[256]
+
+    static func make() -> Cosines:
+        var result = Cosines()
+        for level in 0..<(usize)4:
+            let n = (usize)1 << level
+            let span = 8 // n
+            for x in 0..<n:
+                for k in 0..<(usize)8:
+                    let weight = 0.7071067811865476 if k == 0 else 1.0
+                    var value = math.cos((f64)((2 * x + 1) * k) * 3.141592653589793 / 16.0) * weight
+                    if span > 1:
+                        var sum = 0.0
+                        for j in 0..<span:
+                            sum += math.cos((f64)((2 * (x * span + j) + 1) * k) * 3.141592653589793 / 16.0)
+                        value = sum / (f64)span * weight
+                        # Frequencies a box of this width cancels are exactly zero.
+                        if math.abs(value) < 0.000000000001:
+                            value = 0.0
+                    result.table[level * 64 + x * 8 + k] = value
+                    result.by_frequency[level * 64 + k * 8 + x] = value
+        return result
+
+## The table level of an N-point IDCT.
+func cosine_level(n: usize) -> usize:
+    return 0 if n == 1 else 1 if n == 2 else 2 if n == 4 else 3
+
+## One block's coefficients, dequantized by `quant` (natural order), to an
+## `nh` x `nw` tile at `out`, rows `stride` apart.
+## `across` is the `nw`-point cosine table by frequency, `down` the `nh`-point
+## table by position.
+func idct_block(block: const i16*, quant: const f64*, across: const f64*, down: const f64*, nw: usize, nh: usize, out: u8*, stride: usize):
+    # The nonzero coefficients of each row as a bit mask, which rows have any, and
+    # whether any lies beyond the first column.
+    var masks: u32[8] = ---
+    var rows: u32 = 0
+    var wide: u32 = 0
+    for y in 0..<(usize)8:
+        let words = (const u64*)(block + (y << 3))
+        let mask = nonzero4(words[0]) | (nonzero4(words[1]) << 4)
+        masks[y] = mask
+        rows |= (u32)(mask != 0) << (u32)y
+        wide |= mask
+    if rows == 0:
+        for y in 0..<nh:
+            let line = out + y * stride
+            for x in 0..<nw:
+                line[x] = 128
+        return
+    # Rows: temp[y][x] = 1/2 sum_k F(y, k) cos_x(k), for nonzero rows only, summed
+    # in k order. With only the first column the cosine, and so the row, is flat.
+    var temp: f64[64] = ---
+    let t = &temp[0]
+    var left = rows
+    while left != 0:
+        let y = (usize)lowest_bit[left]
+        left &= left - 1
+        let row = block + (y << 3)
+        let q = quant + (y << 3)
+        let line = t + (y << 3)
+        if wide <= 1:
+            line[0] = (0.0 + ((f64)row[0] * q[0]) * across[0]) * 0.5
+            continue
+        if nw == 8:
+            # Eight points, the full-size case, with the sums in registers.
+            var s0 = 0.0
+            var s1 = 0.0
+            var s2 = 0.0
+            var s3 = 0.0
+            var s4 = 0.0
+            var s5 = 0.0
+            var s6 = 0.0
+            var s7 = 0.0
+            var terms = masks[y]
+            while terms != 0:
+                let k = (usize)lowest_bit[terms]
+                terms &= terms - 1
+                let a = (f64)row[k] * q[k]
+                let basis = across + (k << 3)
+                s0 = s0 + basis[0] * a
+                s1 = s1 + basis[1] * a
+                s2 = s2 + basis[2] * a
+                s3 = s3 + basis[3] * a
+                s4 = s4 + basis[4] * a
+                s5 = s5 + basis[5] * a
+                s6 = s6 + basis[6] * a
+                s7 = s7 + basis[7] * a
+            line[0] = s0 * 0.5
+            line[1] = s1 * 0.5
+            line[2] = s2 * 0.5
+            line[3] = s3 * 0.5
+            line[4] = s4 * 0.5
+            line[5] = s5 * 0.5
+            line[6] = s6 * 0.5
+            line[7] = s7 * 0.5
+            continue
+        for x in 0..<nw:
+            line[x] = 0.0
+        var terms = masks[y]
+        while terms != 0:
+            let k = (usize)lowest_bit[terms]
+            terms &= terms - 1
+            let a = (f64)row[k] * q[k]
+            let basis = across + (k << 3)
+            for x in 0..<nw:
+                line[x] = line[x] + basis[x] * a
+        for x in 0..<nw:
+            line[x] = line[x] * 0.5
+    # Columns: out[y][x] = 1/2 sum_k temp[k][x] cos_y(k) + 128.
+    if wide <= 1:
+        # Every column alike: one value a row.
+        for y in 0..<nh:
+            let basis = down + (y << 3)
+            var sum = 0.0
+            var terms = rows
+            while terms != 0:
+                let k = (usize)lowest_bit[terms]
+                terms &= terms - 1
+                sum = sum + t[k << 3] * basis[k]
+            let value = sample(sum)
+            let line = out + y * stride
+            for x in 0..<nw:
+                line[x] = value
+        return
+    if rows == 1:
+        # The first row only: cos_y(0) is the same for every y, so every row alike.
+        let first = down[0]
+        for x in 0..<nw:
+            out[x] = sample(0.0 + t[x] * first)
+        for y in 1..<nh:
+            let line = out + y * stride
+            for x in 0..<nw:
+                line[x] = out[x]
+        return
+    if nw == 8:
+        for y in 0..<nh:
+            let basis = down + (y << 3)
+            var s0 = 0.0
+            var s1 = 0.0
+            var s2 = 0.0
+            var s3 = 0.0
+            var s4 = 0.0
+            var s5 = 0.0
+            var s6 = 0.0
+            var s7 = 0.0
+            var terms = rows
+            while terms != 0:
+                let k = (usize)lowest_bit[terms]
+                terms &= terms - 1
+                let c = basis[k]
+                let line = t + (k << 3)
+                s0 = s0 + line[0] * c
+                s1 = s1 + line[1] * c
+                s2 = s2 + line[2] * c
+                s3 = s3 + line[3] * c
+                s4 = s4 + line[4] * c
+                s5 = s5 + line[5] * c
+                s6 = s6 + line[6] * c
+                s7 = s7 + line[7] * c
+            let line = out + y * stride
+            line[0] = sample(s0)
+            line[1] = sample(s1)
+            line[2] = sample(s2)
+            line[3] = sample(s3)
+            line[4] = sample(s4)
+            line[5] = sample(s5)
+            line[6] = sample(s6)
+            line[7] = sample(s7)
+        return
+    var sums: f64[8] = ---
+    let acc = &sums[0]
+    for y in 0..<nh:
+        let basis = down + (y << 3)
+        for x in 0..<nw:
+            acc[x] = 0.0
+        var terms = rows
+        while terms != 0:
+            let k = (usize)lowest_bit[terms]
+            terms &= terms - 1
+            let c = basis[k]
+            let line = t + (k << 3)
+            for x in 0..<nw:
+                acc[x] = acc[x] + line[x] * c
+        let line = out + y * stride
+        for x in 0..<nw:
+            line[x] = sample(acc[x])
+
+## Which of four 16-bit lanes of `w` are nonzero, as bits 0..3.
+inline func nonzero4(w: u64) -> u32:
+    # Each lane's two bytes or'ed into its low byte; + 0xFF carries into bit 8 when
+    # nonzero; the four carries gathered to bits 48..51 by one multiply.
+    let low = (w | (w >> 8)) & 0x00FF00FF00FF00FF
+    let carries = ((low + 0x00FF00FF00FF00FF) >> 8) & 0x0001000100010001
+    return (u32)((carries *% 0x0001000200040008) >> 48) & 15
+
+## The index of the lowest set bit of an 8-bit mask.
+let lowest_bit: u8[256] = [0, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 6, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 7, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 6, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 5, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0, 4, 0, 1, 0, 2, 0, 1, 0, 3, 0, 1, 0, 2, 0, 1, 0]
+
+## A column sum to a sample: floor(sum / 2 + 128.5) clamped to 0..255.
+inline func sample(sum: f64) -> u8:
+    return floor8(sum * 0.5 + 128.5)
+
+## 2^52 + 2^51: adding it to a float below 2^51 in magnitude leaves the nearest
+## integer in the low bits of the result.
+let magic: f64 = 6755399441055744.0
+
+## floor(v) clamped to 0..255, for |v| < 2^50, without a float-to-integer call
+## or a branch: the nearest integer, less one where that rounded up.
+inline func floor8(v: f64) -> u8:
+    let t = v + magic
+    let n = (i64)(t.bits() -% 0x4338000000000000) -% (i64)(t - magic > v)
+    let low = n & ~(n >> 63)
+    return (u8)(low | ((255 -% low) >> 63))

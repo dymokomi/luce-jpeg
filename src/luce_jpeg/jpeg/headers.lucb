@@ -1,0 +1,299 @@
+#==============================================================================================
+#
+#   jpeg/headers - The decoder state, markers, frame, tables and scan headers
+#
+#==============================================================================================
+
+let zigzag: usize[64] = [0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63]
+
+## One colour component: its coding, its coefficients and, once rendering starts,
+## the plane its IDCT writes and how that plane maps onto output pixels.
+struct Component:
+    var id: u8
+    var horizontal: usize
+    var vertical: usize
+    var quant: usize
+    var dc: usize
+    var ac: usize
+    ## Blocks across and down, padded to whole MCUs, and those covering the picture.
+    var bx: usize
+    var by: usize
+    var actual_bx: usize
+    var actual_by: usize
+    ## Quantized coefficients, 64 a block in natural order, blocks row after row.
+    var coefficients: i16[]
+    ## Progressive frames: each block's nonzero AC coefficients by zigzag index.
+    var nonzero: u64[]
+    ## The successive-approximation bit each coefficient was last coded to, -1 before any.
+    var progression: i32[64]
+    ## The IDCT's output block size: 8 at full size, fewer when DCT-scaled.
+    var out_w: usize
+    var out_h: usize
+    ## IDCT output: bx * out_w samples across (the stride), by * out_h down.
+    var plane: u8[]
+    var stride: usize
+    var rows: usize
+    ## Plane samples that cover the picture, the limit of upsampling's edge clamp.
+    var valid_w: usize
+    var valid_h: usize
+    ## Upsampled by repeating samples rather than interpolating (scaled decodes).
+    var replicate: bool
+    ## Plane samples per output pixel, num/den, in each direction.
+    var num_x: usize
+    var den_x: usize
+    var num_y: usize
+    var den_y: usize
+
+struct Decoder:
+    var data: const u8[]
+    var max_bytes: usize
+    var width: usize
+    var height: usize
+    var components: Component[4]
+    var count: usize
+    ## DC tables 0..3 then AC tables 4..7, on the heap (100 KB) to spare the stack.
+    var tables: Huffman[]
+    var quant: u32[256]
+    var quant_present: bool[4]
+    var max_h: usize
+    var max_v: usize
+    var mcux: usize
+    var mcuy: usize
+    var restart: usize
+    var progressive: bool
+    var adobe: i32 = -1
+    ## Threads asked for (0: every processor), and those used once the size is known.
+    var requested: usize
+    var threads: usize = 1
+    ## Where and at what scale the picture renders; `rendered` once it has, during
+    ## its scan.
+    var target: Target*?
+    var scale: usize = 1
+    var rendered: bool
+    ## A probed Raster the frame must match.
+    var expected: const Raster*?
+
+    mutating func close():
+        if self.tables.length > 0:
+            free(self.tables) in memory.heap
+        for i in 0..<self.count:
+            if self.components[i].coefficients.length > 0:
+                free(self.components[i].coefficients) in memory.heap
+            if self.components[i].plane.length > 0:
+                free(self.components[i].plane) in memory.heap
+            if self.components[i].nonzero.length > 0:
+                free(self.components[i].nonzero) in memory.heap
+
+    ## Read every marker segment through the end of image, entropy-decoding each scan
+    ## into the components' coefficients, then render them into `target`.
+    mutating func decode() -> !:
+        try self.read()
+        if not self.rendered:
+            try render(&self)
+
+    ## Read every marker segment through the end of image, entropy-decoding each scan
+    ## into the components' coefficients (and rendering a pipelined scan's rows).
+    mutating func read() -> !:
+        self.tables = try new Huffman[8] in memory.heap
+        var reader = Reader(data = self.data, little = false)
+        if try reader.uint(2) != 65496:
+            error(corrupt, "invalid JPEG signature")
+        var ended = false
+        while reader.position < reader.data.length:
+            let code = try marker(&reader)
+            if code == 217:
+                ended = true
+                break
+            var s = try segment(&reader)
+            if code == 192 or code == 193 or code == 194:
+                try self.frame(&s, code)
+            elif code == 219:
+                try self.quantization(&s)
+            elif code == 196:
+                try self.huffman(&s)
+            elif code == 221:
+                self.restart = (usize)(try s.uint(2))
+            elif code == 218:
+                if self.count == 0:
+                    error(corrupt, "JPEG scan before frame")
+                let header = try scan_header(&self, &s)
+                if self.progressive:
+                    try progressive_scan(&self, &header, &reader)
+                elif pipelines(&self, &header):
+                    try pipelined_scan(&self, &header, &reader)
+                else:
+                    try sequential_scan(&self, &header, &reader)
+            elif code == 238 and s.data.length >= 12 and (str)s.data[..<5] == "Adobe":
+                self.adobe = (i32)s.data[11]
+            elif (code >= 195 and code <= 207) or code == 220:
+                error(unsupported, "unsupported JPEG coding process")
+        if not ended:
+            error(corrupt, "JPEG end marker missing")
+        for i in 0..<self.count:
+            let c = &self.components[i]
+            if not self.quant_present[c.quant] or c.progression[0] == -1:
+                error(corrupt, "JPEG component lacks quantization or DC scan")
+
+    mutating func frame(h: Reader*, code: u8) -> !:
+        if self.count != 0:
+            error(corrupt, "multiple JPEG frame headers")
+        if try h.byte() != 8:
+            error(unsupported, "JPEG requires 8-bit precision")
+        self.height = (usize)(try h.uint(2))
+        self.width = (usize)(try h.uint(2))
+        let count = (usize)(try h.byte())
+        if count != 1 and count != 3 and count != 4:
+            error(unsupported, "JPEG requires grayscale, RGB/YCbCr or CMYK/YCCK")
+        if self.width == 0 or self.height == 0 or self.width > 1000000 or self.height > 1000000:
+            error(unsupported, "JPEG dimensions must be 1 through 1000000")
+        if let probed = self.expected:
+            if probed.width != self.width or probed.height != self.height:
+                error(corrupt, "JPEG frame dimensions changed")
+            if probed.photo != (u64)count:
+                error(corrupt, "JPEG frame component count mismatch")
+        self.count = count
+        self.progressive = code == 194
+        self.threads = thread_count(self.requested, self.width * self.height)
+        var blocks: usize = 0
+        for i in 0..<self.count:
+            let c = &self.components[i]
+            c.id = try h.byte()
+            let sampling = try h.byte()
+            c.horizontal = (usize)(sampling >> 4)
+            c.vertical = (usize)(sampling & 15)
+            c.quant = (usize)(try h.byte())
+            if c.horizontal == 0 or c.horizontal > 4 or c.vertical == 0 or c.vertical > 4 or c.quant > 3:
+                error(corrupt, "invalid JPEG sampling factors")
+            for j in 0..<i:
+                if self.components[j].id == c.id:
+                    error(corrupt, "duplicate JPEG component ID")
+            self.max_h = c.horizontal if c.horizontal > self.max_h else self.max_h
+            self.max_v = c.vertical if c.vertical > self.max_v else self.max_v
+            blocks += c.horizontal * c.vertical
+        if blocks > 10:
+            error(corrupt, "JPEG MCU has too many blocks")
+        self.mcux = (self.width + self.max_h * 8 - 1) // (self.max_h * 8)
+        self.mcuy = (self.height + self.max_v * 8 - 1) // (self.max_v * 8)
+        var allocated: usize = 0
+        for i in 0..<self.count:
+            let c = &self.components[i]
+            c.bx = self.mcux * c.horizontal
+            c.by = self.mcuy * c.vertical
+            c.actual_bx = (self.width * c.horizontal + self.max_h * 8 - 1) // (self.max_h * 8)
+            c.actual_by = (self.height * c.vertical + self.max_v * 8 - 1) // (self.max_v * 8)
+            # Two bytes a coefficient, up to one plane sample for each, and for a
+            # progressive frame a nonzero bitmap of eight bytes a block.
+            let coefficients = c.bx * c.by * 64
+            allocated += coefficients * 3 + (coefficients // 8 if self.progressive else 0)
+            if allocated > self.max_bytes:
+                error(limit, "JPEG coefficient and sample buffers exceed byte limit")
+            c.coefficients = try new i16[coefficients] in memory.heap
+            if self.progressive:
+                c.nonzero = try new u64[c.bx * c.by] in memory.heap
+            for k in 0..<64:
+                c.progression[k] = -1
+
+    mutating func quantization(s: Reader*) -> !:
+        while s.position < s.data.length:
+            let selector = try s.byte()
+            let index = (usize)(selector & 15)
+            let precision = selector >> 4
+            if index > 3 or precision > 1:
+                error(corrupt, "invalid JPEG quantization table")
+            for i in 0..<(usize)64:
+                let value = try s.uint(2 if precision == 1 else 1)
+                if value == 0:
+                    error(corrupt, "zero JPEG quantization value")
+                self.quant[index * 64 + zigzag[i]] = (u32)value
+            self.quant_present[index] = true
+
+    mutating func huffman(s: Reader*) -> !:
+        while s.position < s.data.length:
+            let selector = try s.byte()
+            if (selector >> 4) > 1 or (selector & 15) > 3:
+                error(corrupt, "invalid JPEG Huffman table selector")
+            var counts: u32[17]
+            var count: usize = 0
+            var left: i32 = 1
+            for n in 1..<(usize)17:
+                counts[n] = (u32)(try s.byte())
+                count += (usize)counts[n]
+                left = left * 2 - (i32)counts[n]
+                if left < 0:
+                    error(corrupt, "oversubscribed JPEG Huffman table")
+            if count > 256 or count == 0:
+                error(corrupt, "invalid JPEG Huffman symbol count")
+            let values = try s.take(count)
+            build_huffman(&self.tables[(usize)(selector & 15) + (4 if (selector >> 4) == 1 else 0)], counts, values)
+
+## The parameters of one scan, from its SOS segment.
+struct Scan:
+    var count: usize
+    var selected: usize[4]
+    var ss: usize
+    var se: usize
+    var ah: u32
+    var al: u32
+    ## MCUs across and down: the component's blocks for a one-component scan.
+    var across: usize
+    var down: usize
+
+func scan_header(d: Decoder*, header: Reader*) -> Scan!:
+    var scan = Scan()
+    let ns = (usize)(try header.byte())
+    if ns < 1 or ns > d.count:
+        error(corrupt, "invalid JPEG scan component count")
+    scan.count = ns
+    for i in 0..<ns:
+        let id = try header.byte()
+        let tables = try header.byte()
+        if (tables >> 4) > 3 or (tables & 15) > 3:
+            error(corrupt, "invalid JPEG table selector")
+        var found = false
+        for c in 0..<d.count:
+            if d.components[c].id == id:
+                scan.selected[i] = c
+                found = true
+        if not found:
+            error(corrupt, "JPEG scan references unknown component")
+        for j in 0..<i:
+            if scan.selected[j] == scan.selected[i]:
+                error(corrupt, "duplicate JPEG scan component")
+        d.components[scan.selected[i]].dc = (usize)(tables >> 4)
+        d.components[scan.selected[i]].ac = (usize)(tables & 15)
+    scan.ss = (usize)(try header.byte())
+    scan.se = (usize)(try header.byte())
+    let approx = try header.byte()
+    scan.ah = (u32)(approx >> 4)
+    scan.al = (u32)(approx & 15)
+    let ss = scan.ss
+    let se = scan.se
+    let ah = scan.ah
+    let al = scan.al
+    if ss > se or se > 63 or al > 13 or ah > 13 or (not d.progressive and (ss != 0 or se != 63 or ah != 0 or al != 0)) or (d.progressive and ((ss == 0 and se != 0) or (ss > 0 and ns != 1))) or (ah != 0 and ah != al + 1):
+        error(corrupt, "invalid JPEG scan parameters")
+    for i in 0..<ns:
+        let component = &d.components[scan.selected[i]]
+        for k in ss..<se + 1:
+            if (ah == 0 and component.progression[k] != -1) or (ah != 0 and component.progression[k] != (i32)ah):
+                error(corrupt, "invalid JPEG progressive scan order")
+            component.progression[k] = (i32)al
+    scan.across = d.components[scan.selected[0]].actual_bx if ns == 1 else d.mcux
+    scan.down = d.components[scan.selected[0]].actual_by if ns == 1 else d.mcuy
+    return scan
+
+func marker(reader: Reader*) -> u8!:
+    if try reader.byte() != 255:
+        error(corrupt, "JPEG marker prefix missing")
+    var value = try reader.byte()
+    while value == 255:
+        value = try reader.byte()
+    if value == 0:
+        error(corrupt, "JPEG stuffed byte outside scan")
+    return value
+
+func segment(reader: Reader*) -> Reader!:
+    let size = (usize)(try reader.uint(2))
+    if size < 2:
+        error(corrupt, "JPEG marker length below two")
+    return Reader(data = try reader.take(size - 2), little = false)

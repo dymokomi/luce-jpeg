@@ -1,0 +1,153 @@
+#==============================================================================================
+#
+#   jpeg - Baseline and progressive JPEG decoding, baseline encoding
+#
+#   DESCRIPTION:
+#       8-bit Huffman JPEG: sequential and progressive scans, restart markers, grayscale,
+#       YCbCr, RGB, CMYK and YCCK, any sampling factors. Decoding runs in three stages:
+#       entropy decoding into quantized coefficients, an exact separable f64 IDCT into
+#       component planes, and upsampling with colour conversion into output rows. The
+#       last two run in MCU-row bands on every processor: for a baseline picture while
+#       the calling thread is still entropy-decoding later rows, and restart intervals
+#       entropy-decode on every processor too. A decode can be scaled to 1/2, 1/4 or 1/8
+#       straight from the DCT, as libjpeg's scale_denom does.
+#
+#       Output goes to 8-bit RGBA or RGB bytes (`decode_rgba8`, `decode_rgb8`), to a
+#       row callback in top-to-bottom bands (`decode_rows`), or to a Raster's f64
+#       samples (`probe` then `decode`). Every route produces the same sample values,
+#       bit for bit those of the plain float decoder this one replaced.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb       the public API
+#       headers.lucb      the decoder state, markers, frame, tables and scan headers
+#       huffman.lucb      Huffman tables with 11-bit lookahead, and the 64-bit bit reader
+#       sequential.lucb   baseline scans, split across threads at restart markers
+#       progressive.lucb  spectral selection and successive approximation scans
+#       idct.lucb         the exact separable IDCT, full size and DCT-scaled
+#       color.lucb        upsampling and colour conversion of one output row
+#       render.lucb       the worker crew, render geometry, the band schedule, targets
+#       encode.lucb       the baseline encoder
+#       tests.lucb        the module's tests
+#
+#==============================================================================================
+import memory
+import math
+import thread
+import os
+import sync
+from binary import Reader, Buffer
+from raster import Raster
+from raster_errors import corrupt, unsupported, invalid, limit
+
+## A JPEG's size and coding, from its frame header.
+pub struct Info:
+    pub var width: usize
+    pub var height: usize
+    ## 1 grayscale, 3 YCbCr or RGB, 4 CMYK or YCCK.
+    pub var components: usize
+    pub var progressive: bool
+
+    ## The width of a decode at 1/`scale` size, rounded up as libjpeg does.
+    pub func scaled_width(scale: usize) -> usize:
+        return (self.width + scale - 1) // scale
+
+    ## The height of a decode at 1/`scale` size, rounded up.
+    pub func scaled_height(scale: usize) -> usize:
+        return (self.height + scale - 1) // scale
+
+## How a decode runs.
+pub struct Options:
+    ## 1, 2, 4 or 8: decode at 1/scale of the full size, straight from the DCT.
+    pub var scale: usize = 1
+    ## Worker threads, counting the caller's; 0 uses every processor.
+    pub var threads: usize = 0
+    ## The most the decoder allocates for coefficients and planes (the output is
+    ## the caller's).
+    pub var max_bytes: usize = 1073741824
+
+## The byte order of 8-bit output pixels.
+pub enum Layout:
+    rgba
+    rgb
+
+## Receives `rows` decoded rows starting at `first_row`, tightly packed, on the
+## decoding thread and in top-to-bottom order. A failure stops the decode.
+pub type RowSink = func(void*?, usize, usize, const u8[]) -> unit!
+
+## The frame header of the JPEG in `data`.
+pub func info(data: const u8[]) -> Info!:
+    var r = Reader(data = data, little = false)
+    if try r.uint(2) != 65496:
+        error(corrupt, "invalid JPEG signature")
+    while true:
+        let code = try marker(&r)
+        if code == 217 or code == 218:
+            error(corrupt, "JPEG has no frame header")
+        var s = try segment(&r)
+        if code == 192 or code == 193 or code == 194:
+            if try s.byte() != 8:
+                error(unsupported, "JPEG sample precision must be 8 bits")
+            let height = (usize)(try s.uint(2))
+            let width = (usize)(try s.uint(2))
+            let count = (usize)(try s.byte())
+            if count != 1 and count != 3 and count != 4:
+                error(unsupported, "JPEG requires grayscale, RGB/YCbCr or CMYK/YCCK")
+            return Info(width = width, height = height, components = count, progressive = code == 194)
+        if code >= 195 and code <= 207 and code != 196 and code != 200 and code != 204:
+            error(unsupported, "lossless or arithmetic JPEG is not supported")
+    error(corrupt, "JPEG has no frame header")
+
+## Fill `image`'s size, channels (Y, or R G B for colour and CMYK) and format from
+## its encoded bytes, ahead of `allocate` and `decode`.
+pub func probe(image: Raster*) -> !:
+    let found = try info(image.encoded)
+    image.height = found.height
+    image.width = found.width
+    image.photo = (u64)found.components
+    try image.standard(3 if found.components == 4 else found.components, .uint8)
+    discard(try image.validate())
+    image.file_format = "JPEG"
+
+## Decode a probed and allocated `image` into its f64 samples, on every processor.
+pub func decode(image: Raster*) -> !:
+    if image.pixels.length != image.width * image.height * image.channels.length:
+        error(invalid, "JPEG raster pixels are not allocated")
+    if image.channels.length != 1 and image.channels.length != 3:
+        error(invalid, "JPEG raster must be probed")
+    var target = Target(doubles = image.pixels, pixel = image.channels.length)
+    var d = Decoder(data = image.encoded, max_bytes = image.max_bytes, requested = 0, target = &target, expected = image)
+    defer d.close()
+    try d.decode()
+
+## Decode into `out` as 8-bit RGBA, alpha 255, at `options.scale`:
+## `info.scaled_width(scale) * info.scaled_height(scale) * 4` bytes, row after row.
+pub func decode_rgba8(data: const u8[], out: u8[], options: Options = Options()) -> !:
+    try decode_bytes(data, out, 4, options)
+
+## Decode into `out` as 8-bit RGB, three bytes a pixel, row after row.
+pub func decode_rgb8(data: const u8[], out: u8[], options: Options = Options()) -> !:
+    try decode_bytes(data, out, 3, options)
+
+## Decode in bands of whole rows, each handed to `sink` with `context`, in `layout`.
+## Only a group of bands' worth of output is held at once.
+pub func decode_rows(data: const u8[], sink: RowSink, context: void*?, layout: Layout = .rgba, options: Options = Options()) -> !:
+    try check_scale(options.scale)
+    var target = Target(pixel = 4 if layout == .rgba else 3, sink = sink, context = context)
+    var d = Decoder(data = data, max_bytes = options.max_bytes, requested = options.threads, target = &target, scale = options.scale)
+    defer d.close()
+    try d.decode()
+
+func decode_bytes(data: const u8[], out: u8[], pixel: usize, options: Options) -> !:
+    try check_scale(options.scale)
+    let found = try info(data)
+    if out.length < found.scaled_width(options.scale) * found.scaled_height(options.scale) * pixel:
+        error(invalid, "JPEG output buffer is smaller than the decoded picture")
+    var target = Target(bytes = out, pixel = pixel)
+    var d = Decoder(data = data, max_bytes = options.max_bytes, requested = options.threads, target = &target, scale = options.scale)
+    defer d.close()
+    try d.decode()
+
+func check_scale(scale: usize) -> !:
+    if scale != 1 and scale != 2 and scale != 4 and scale != 8:
+        error(invalid, "JPEG scale must be 1, 2, 4 or 8")
