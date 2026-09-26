@@ -249,11 +249,11 @@ func progressive_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
             let c = &d.components[scan.selected[i]]
             let horizontal: usize = 1 if one else c.horizontal
             let vertical: usize = 1 if one else c.vertical
-            let base = c.coefficients.data
             for y in 0..<vertical:
+                let line = block_at(c, my * vertical + y, mx * horizontal)
                 for x in 0..<horizontal:
                     let index = (my * vertical + y) * c.bx + mx * horizontal + x
-                    let block = base + index * 64
+                    let block = line + x * 64
                     if ss == 0:
                         if refining:
                             dc_refine(&b, block, al)

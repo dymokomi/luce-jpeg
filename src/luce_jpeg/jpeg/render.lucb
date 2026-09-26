@@ -161,7 +161,7 @@ func plan(d: Decoder*, target: const Target*, scale: usize, ring: usize = 0) -> 
         let c = &d.components[i]
         if not d.quant_present[c.quant]:
             error(corrupt, "JPEG component lacks quantization or DC scan")
-        allocated += c.coefficients.length * 2 + c.nonzero.length * 8
+        allocated += c.bands.length * c.vertical * c.bx * 128 + c.nonzero.length * 8
         # Scaled, a subsampled component takes a larger square IDCT where that
         # replaces upsampling by a power of two in both directions, as libjpeg does.
         var size = n
@@ -212,11 +212,11 @@ func idct_band(job: const RenderJob*, band: usize):
         let across = &job.cosines.by_frequency[cosine_level(c.out_w) * 64]
         let down = &job.cosines.table[cosine_level(c.out_h) * 64]
         let quant = &job.quant[c.quant * 64]
-        let coefficients = c.coefficients.data
         let plane = c.plane.data
         for by in band * c.vertical..<(band + 1) * c.vertical:
+            let line = block_at(c, by, 0)
             for bx in 0..<c.bx:
-                idct_block(coefficients + (block_row(c, by) * c.bx + bx) * 64, quant, across, down, c.out_w, c.out_h, plane + plane_row(c, by * c.out_h) * c.stride + bx * c.out_w, c.stride)
+                idct_block(line + bx * 64, quant, across, down, c.out_w, c.out_h, plane + plane_row(c, by * c.out_h) * c.stride + bx * c.out_w, c.stride)
 
 func idct_task(context: void*, band: usize, scratch: Scratch*):
     idct_band((RenderJob*)context, band)
@@ -371,7 +371,7 @@ func pipelined_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
 ## Whether a scan streams to the row sink: the frame's one interleaved baseline
 ## scan, its coefficients not made whole already by an earlier scan.
 func streams(d: const Decoder*, scan: const Scan*) -> bool:
-    if d.progressive or not d.to_sink() or scan.count != d.count or d.components[0].coefficients.length > 0:
+    if d.progressive or not d.to_sink() or scan.count != d.count or d.components[0].bands.length > 0:
         return false
     return d.count > 1 or (d.components[0].horizontal == 1 and d.components[0].vertical == 1)
 
@@ -386,8 +386,8 @@ func streamed_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
     let group = d.threads * 2 if d.threads > 1 else 2
     for i in 0..<d.count:
         let c = &d.components[i]
-        c.ring = group * (1 if scan.count == 1 else c.vertical)
-        c.coefficients = try new i16[c.ring * c.bx * 64] in memory.heap
+        c.ring = group
+        try allocate_bands(c, group)
     let job = try plan(d, target, d.scale, group + 2)
     defer free(job) in memory.heap
     let width = job.width
@@ -404,7 +404,8 @@ func streamed_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
         let count = group if decoded + group <= scan.down else scan.down - decoded
         # Blocks decode into zeroed coefficients.
         for i in 0..<d.count:
-            memory.set(u8[]((u8*)d.components[i].coefficients.data, d.components[i].coefficients.length * 2), 0)
+            for slot in d.components[i].bands:
+                memory.set(u8[]((u8*)slot.blocks.data, slot.blocks.length * 2), 0)
         try sequential_range(d, scan, &b, &cursor, decoded * scan.across, (decoded + count) * scan.across)
         job.first_band = decoded
         try run_tasks(idct_group_task, (void*)job, count, d.threads)
@@ -432,10 +433,7 @@ func idct_group_task(context: void*, index: usize, scratch: Scratch*):
 func release_coefficients(d: Decoder*):
     for i in 0..<d.count:
         let c = &d.components[i]
-        if c.coefficients.length > 0:
-            free(c.coefficients) in memory.heap
-            var empty: i16[]
-            c.coefficients = empty
+        release_bands(c)
         if c.nonzero.length > 0:
             free(c.nonzero) in memory.heap
             var none_left: u64[]
@@ -459,8 +457,16 @@ func render(d: Decoder*) -> !:
 ## time, as a streamed scan does: the IDCT into a ring of planes two MCU rows
 ## longer than the group (a band's colour reads the rows either side), and
 ## every band whose next row is in coloured and handed on. The planes stay a
-## few rows, whatever the picture; the coefficients go once all are made.
+## few rows, whatever the picture, and each MCU row's coefficients go once its
+## planes are made, as the rows made from them go out.
 func render_rows(d: Decoder*, target: Target*, deliver: RowSink) -> !:
+    # The progressive scans' bitmaps are done with.
+    for i in 0..<d.count:
+        let c = &d.components[i]
+        if c.nonzero.length > 0:
+            free(c.nonzero) in memory.heap
+            var none_left: u64[]
+            c.nonzero = none_left
     let group = d.threads * 2 if d.threads > 1 else 2
     let job = try plan(d, target, d.scale, group + 2)
     defer free(job) in memory.heap
@@ -476,9 +482,10 @@ func render_rows(d: Decoder*, target: Target*, deliver: RowSink) -> !:
         let count = group if made + group <= d.mcuy else d.mcuy - made
         job.first_band = made
         try run_tasks(idct_group_task, (void*)job, count, d.threads)
+        for i in 0..<d.count:
+            for band in made..<made + count:
+                release_band(&d.components[i], band)
         made += count
-        if made == d.mcuy:
-            release_coefficients(d)
         let ready = made - 1 if made < d.mcuy else color_bands
         let last_band = ready if ready < color_bands else color_bands
         if last_band > colored:

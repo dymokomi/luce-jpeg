@@ -20,10 +20,14 @@ struct Component:
     var by: usize
     var actual_bx: usize
     var actual_by: usize
-    ## Quantized coefficients, 64 a block in natural order, blocks row after row.
-    ## A streamed scan keeps a ring of `ring` block rows instead (0: every row).
-    var coefficients: i16[]
+    ## Quantized coefficients, 64 a block in natural order, an allocation an MCU
+    ## row (`vertical` block rows) so a render lets each go once it is made. A
+    ## streamed scan keeps a ring of `ring` MCU rows instead (0: every row).
+    var bands: CoefficientRow[]
     var ring: usize
+    ## log2 of `vertical` when it is 1, 2 or 4 (8 otherwise): a shift finds a
+    ## block row's MCU row in the scans' inner loops.
+    var band_shift: u32
     ## Progressive frames: each block's nonzero AC coefficients by zigzag index.
     var nonzero: u64[]
     ## The successive-approximation bit each coefficient was last coded to, -1 before any.
@@ -47,6 +51,41 @@ struct Component:
     var den_x: usize
     var num_y: usize
     var den_y: usize
+
+## One MCU row's coefficients of a component.
+struct CoefficientRow:
+    var blocks: i16[]
+
+## `count` MCU rows of zeroed coefficients for `c`.
+func allocate_bands(c: Component*, count: usize) -> !:
+    c.band_shift = 0 if c.vertical == 1 else 1 if c.vertical == 2 else 2 if c.vertical == 4 else 8
+    c.bands = try new CoefficientRow[count] in memory.heap
+    for band in 0..<count:
+        c.bands[band].blocks = try new i16[c.vertical * c.bx * 64] in memory.heap
+
+## Let go of MCU row `band`'s coefficients, made into planes.
+func release_band(c: Component*, band: usize):
+    if c.bands[band].blocks.length > 0:
+        free(c.bands[band].blocks) in memory.heap
+        var empty: i16[]
+        c.bands[band].blocks = empty
+
+## Let go of every coefficient `c` holds.
+func release_bands(c: Component*):
+    if c.bands.length == 0:
+        return
+    for band in 0..<c.bands.length:
+        release_band(c, band)
+    free(c.bands) in memory.heap
+    var empty: CoefficientRow[]
+    c.bands = empty
+
+## Block (`column`, `row`) of `c`'s coefficients: in its MCU row's allocation,
+## or a streamed scan's ring slot.
+inline func block_at(c: const Component*, row: usize, column: usize) -> i16*:
+    let band = row >> c.band_shift if c.band_shift < 8 else row // c.vertical
+    let slot = band if c.ring == 0 else band % c.ring
+    return c.bands[slot].blocks.data + ((row - band * c.vertical) * c.bx + column) * 64
 
 struct Decoder:
     var data: const u8[]
@@ -87,8 +126,7 @@ struct Decoder:
         if self.tables.length > 0:
             free(self.tables) in memory.heap
         for i in 0..<self.count:
-            if self.components[i].coefficients.length > 0:
-                free(self.components[i].coefficients) in memory.heap
+            release_bands(&self.components[i])
             if self.components[i].plane.length > 0:
                 free(self.components[i].plane) in memory.heap
             if self.components[i].nonzero.length > 0:
@@ -207,10 +245,9 @@ struct Decoder:
                 error(limit, "JPEG coefficient and sample buffers exceed byte limit")
             # A baseline picture going to a row sink may stream (render/streamed_scan):
             # its coefficients wait for the scan to say whether it does.
-            if not self.progressive and self.to_sink():
-                c.ring = 0
-            else:
-                c.coefficients = try new i16[coefficients] in memory.heap
+            c.ring = 0
+            if self.progressive or not self.to_sink():
+                try allocate_bands(c, self.mcuy)
             if self.progressive:
                 c.nonzero = try new u64[c.bx * c.by] in memory.heap
             for k in 0..<64:
@@ -225,8 +262,8 @@ struct Decoder:
     mutating func whole_coefficients() -> !:
         for i in 0..<self.count:
             let c = &self.components[i]
-            if c.coefficients.length == 0:
-                c.coefficients = try new i16[c.bx * c.by * 64] in memory.heap
+            if c.bands.length == 0:
+                try allocate_bands(c, self.mcuy)
 
     mutating func quantization(s: Reader*) -> !:
         while s.position < s.data.length:
