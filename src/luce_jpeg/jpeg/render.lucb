@@ -70,10 +70,9 @@ func crew_start(task: func(void*, usize, Scratch*) -> unit, context: void*, coun
         error(failure.code, failure.message)
     for i in 0..<workers:
         crew.slots[i] = Worker(pool = &crew.pool, scratch = Scratch())
+    errdefer release(crew)
     for i in 0..<workers:
-        allocate_scratch(&crew.slots[i].scratch, width, column, bytes) catch failure:
-            release(crew)
-            error(failure.code, failure.message)
+        try allocate_scratch(&crew.slots[i].scratch, width, column, bytes)
     for i in 1..<workers:
         crew.handles[crew.started] = thread.spawn(worker_main, (void*)&crew.slots[i], name = "jpeg") catch:
             # Fewer threads: the others take its share from the counter.
@@ -307,13 +306,10 @@ func schedule_task(context: void*, t: usize, scratch: Scratch*):
 func schedule_new(job: RenderJob*, decoded: bool) -> Schedule*!:
     let d = job.d
     let s = try new Schedule(job = job, bands = d.mcuy, color_bands = (job.height + job.band_rows - 1) // job.band_rows) in memory.heap
-    s.ready = new Gate[d.mcuy] in memory.heap catch failure:
-        free(s) in memory.heap
-        error(failure.code, failure.message)
-    s.done = new Gate[d.mcuy] in memory.heap catch failure:
-        free(s.ready) in memory.heap
-        free(s) in memory.heap
-        error(failure.code, failure.message)
+    errdefer free(s) in memory.heap
+    s.ready = try new Gate[d.mcuy] in memory.heap
+    errdefer free(s.ready) in memory.heap
+    s.done = try new Gate[d.mcuy] in memory.heap
     if decoded:
         for i in 0..<d.mcuy:
             s.ready[i].open()
