@@ -78,7 +78,8 @@ pub func decode_rows_at(read: ReadAt, source: void*?, size: u64, sink: RowSink, 
     var window = try Window.open(read, source, size)
     defer window.close()
     var target = Target(pixel = 4 if layout == .rgba else 3, sink = sink, context = context)
-    var d = Decoder(data = window.view(), max_bytes = options.max_bytes, requested = options.threads, target = &target, scale = options.scale, window = &window)
+    var d = Decoder(data = window.view(), max_bytes = options.max_bytes, requested = options.threads, target = &target, scale = options.scale, window = &window,
+                    coarse = options.coarse, coarse_context = options.coarse_context)
     defer d.close()
     try d.decode()
 

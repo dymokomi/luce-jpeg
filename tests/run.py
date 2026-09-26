@@ -135,7 +135,46 @@ def check_drivers(tmp, flags):
                 damaged += 1
     print(f"ok    {damaged} decodes of damaged files ended cleanly")
     check_large(tmp, scaled)
+    check_coarse(tmp, scaled)
     check_encoder(tmp, flags, scaled)
+
+
+def check_coarse(tmp, scaled):
+    """A progressive picture's first sight, from its DC scans, is its 1/8 decode
+    but for the DC's last bits; a baseline picture gives none."""
+    coarse, out = tmp / "coarse", tmp / "out"
+    checked = 0
+    for fixture in FIXTURES:
+        coarse.unlink(missing_ok=True)
+        if run([scaled, fixture, coarse, 1, "coarse", 0]).returncode != 0:
+            fail(f"{fixture.name}: the coarse decode failed")
+        if coarse.stat().st_size == 0:
+            continue
+        run([scaled, fixture, out, 8, "rgba", 0], check=True)
+        w, h, _, near = read_raw(coarse)
+        w8, h8, _, eighth = read_raw(out)
+        # Unsubsampled, the 1/8 decode is the DC alone too: only the DC's last
+        # bits (successive approximation) differ. Subsampled chroma decodes from a
+        # 2x2 IDCT there, whose AC coefficients come later, so only the luma
+        # (the DC alone either way) is compared, where no sample is clipped.
+        if (w, h) != (w8, h8):
+            fail(f"{fixture.name}: the coarse picture is {w}x{h}, not {w8}x{h8}")
+        subsampled = "420" in fixture.name or "422" in fixture.name or fixture.name == "pscans.jpg"
+        worst = 0
+        for p in range(0, len(near), 4):
+            a, b = near[p:p + 3], eighth[p:p + 3]
+            if subsampled:
+                if min(a) == 0 or max(a) == 255 or min(b) == 0 or max(b) == 255:
+                    continue
+                worst = max(worst, abs((0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2]) - (0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2])))
+            else:
+                worst = max(worst, *(abs(x - y) for x, y in zip(a, b)))
+        if worst > 12:
+            fail(f"{fixture.name}: the coarse picture is {worst:.0f} from the 1/8 decode")
+        checked += 1
+    if checked < 10:
+        fail(f"only {checked} progressive fixtures gave a coarse picture")
+    print(f"ok    {checked} progressive pictures show a coarse picture from their first scans")
 
 
 def check_large(tmp, scaled):
@@ -156,6 +195,7 @@ def check_large(tmp, scaled):
         if read_raw(out)[3] != read_raw(whole)[3]:
             fail(f"large {name}: read in pieces differs from the file whole")
     print("ok    large files read in pieces decode as the file whole")
+
 
 
 def check_encoder(tmp, flags, scaled):

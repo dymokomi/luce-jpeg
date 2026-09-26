@@ -71,6 +71,10 @@ pub struct Options:
     ## The most the decoder allocates for coefficients and planes (the output is
     ## the caller's).
     pub var max_bytes: usize = 1073741824
+    ## Row decodes of a progressive picture: its first sight, the picture at 1/8
+    ## size as RGBA once the first scans are in, long before its rows.
+    pub var coarse: CoarseSink? = none
+    pub var coarse_context: void*? = none
 
 ## The byte order of 8-bit output pixels.
 pub enum Layout:
@@ -80,6 +84,10 @@ pub enum Layout:
 ## Receives `rows` decoded rows starting at `first_row`, tightly packed, on the
 ## decoding thread and in top-to-bottom order. A failure stops the decode.
 pub type RowSink = func(void*?, usize, usize, const u8[]) -> unit!
+
+## Receives a coarse picture, `width` by `height` RGBA pixels, on the decoding
+## thread. A failure stops the decode.
+pub type CoarseSink = func(void*?, usize, usize, const u8[]) -> unit!
 
 ## The frame header of the JPEG in `data`.
 pub func info(data: const u8[]) -> Info!:
@@ -166,7 +174,7 @@ pub func decode_rgb8(data: const u8[], out: u8[], options: Options = Options()) 
 pub func decode_rows(data: const u8[], sink: RowSink, context: void*?, layout: Layout = .rgba, options: Options = Options()) -> !:
     try check_scale(options.scale)
     var target = Target(pixel = 4 if layout == .rgba else 3, sink = sink, context = context)
-    var d = Decoder(data = data, max_bytes = options.max_bytes, requested = options.threads, target = &target, scale = options.scale)
+    var d = Decoder(data = data, max_bytes = options.max_bytes, requested = options.threads, target = &target, scale = options.scale, coarse = options.coarse, coarse_context = options.coarse_context)
     defer d.close()
     try d.decode()
 

@@ -78,6 +78,10 @@ struct Decoder:
     var expected: const Raster*?
     ## The file read in pieces (jpeg/source): `data` is what the window holds.
     var window: Window*?
+    ## A progressive picture's 1/8-size first sight goes here, once.
+    var coarse: CoarseSink?
+    var coarse_context: void*?
+    var coarse_done: bool
 
     mutating func close():
         if self.tables.length > 0:
@@ -128,6 +132,8 @@ struct Decoder:
                 let header = try scan_header(&self, &s)
                 if self.progressive:
                     try progressive_scan(&self, &header, &reader)
+                    if self.coarse != none and not self.coarse_done and dc_ready(&self):
+                        try render_coarse(&self)
                 elif streams(&self, &header):
                     try streamed_scan(&self, &header, &reader)
                 elif pipelines(&self, &header):

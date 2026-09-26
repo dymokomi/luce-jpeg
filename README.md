@@ -27,6 +27,7 @@ try jpeg.decode(&raster)
 
 - `Options.scale` is 1, 2, 4 or 8. A scaled decode comes straight from the DCT: each output pixel is the mean of the full-size pixels it covers, before rounding, which is what libjpeg's reduced IDCTs compute in fixed point. Sizes round up (`info.scaled_width(scale)`).
 - `Options.threads` counts the caller's thread; 0 uses every processor.
+- A progressive picture decoding to rows can show itself early: `Options.coarse` hears, once its first scans give every component its DC coefficients, the picture at 1/8 size as RGBA (straight from the DC, as a 1/8 decode is), long before any row. Its rows then render from the coefficients a group of MCU rows at a time through a ring of planes, so a row decode holds the coefficients (two bytes each) and a few rows, not a plane for every sample too.
 - `decode_rows_at` holds a megabyte window of the file, sliding on before each marker segment and, in a scan, between MCUs; restart intervals then decode on one thread.
 - Every route gives the same samples, bit for bit those of the plain float decoder in luce-jpeg 0.1 (exact f64 IDCT, bilinear "fancy" upsampling, f64 YCbCr).
 

@@ -1,6 +1,7 @@
 ## Decodes one JPEG to 8-bit pixels at 1/scale through `decode_rgb8`, `decode_rgba8`
 ## or `decode_rows` (`at`: `decode_rows_at`, the file read in pieces):
-## `scaled <in.jpg> <out.raw> <scale> [rgb|rgba|rows|at] [threads]`,
+## `scaled <in.jpg> <out.raw> <scale> [rgb|rgba|rows|at|coarse] [threads]`,
+## `coarse` writing a progressive picture's first sight (1/8, RGBA) instead,
 ## writing a 12-byte header (width, height, bytes a pixel as little-endian u32)
 ## then the pixel bytes.
 import files
@@ -21,6 +22,22 @@ func collect(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !
         collected.failed = true
     collected.next_row = first + rows
     try collected.out.put(bytes)
+
+## A coarse picture kept.
+struct Coarse:
+    var out: Buffer*
+    var calls: usize
+
+func take_coarse(context: void*?, width: usize, height: usize, pixels: const u8[]) -> !:
+    let coarse = (Coarse*)(context else return)
+    try coarse.out.uint((u64)width, 4)
+    try coarse.out.uint((u64)height, 4)
+    try coarse.out.uint(4, 4)
+    try coarse.out.put(pixels)
+    coarse.calls += 1
+
+func ignore_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    discard(context)
 
 ## `ReadAt` over an open file.
 func read_file(context: void*?, at: u64, into: u8[]) -> usize!:
@@ -43,6 +60,18 @@ pub func main(arguments: str[]) -> i32!:
     try raw.uint((u64)height, 4)
     try raw.uint((u64)pixel, 4)
     let options = jpeg.Options(scale = scale, threads = threads)
+    if mode == "coarse":
+        var picture = Buffer()
+        defer picture.close()
+        var coarse = Coarse(out = &picture, calls = 0)
+        var file = try files.File.open((c.str)arguments[1])
+        defer file.destroy()
+        try jpeg.decode_rows_at(read_file, (void*)&file, (u64)encoded.length, ignore_rows, none, options = jpeg.Options(threads = threads, coarse = take_coarse, coarse_context = (void*)&coarse))
+        if coarse.calls != (1 if info.progressive else 0):
+            print("a coarse picture came for a baseline picture, or not once for a progressive one")
+            return 1
+        try files.write((c.str)arguments[2], picture.view())
+        return 0
     if mode == "at":
         var file = try files.File.open((c.str)arguments[1])
         defer file.destroy()

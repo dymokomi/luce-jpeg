@@ -444,33 +444,80 @@ func release_coefficients(d: Decoder*):
 ## Render a completely read decoder into its target.
 func render(d: Decoder*) -> !:
     let target = d.target else trap("render without a target")
+    if let deliver = target.sink:
+        try render_rows(d, target, deliver)
+        return
     let job = try plan(d, target, d.scale)
     defer free(job) in memory.heap
     let width = job.width
     let column = widest_plane(d)
-    let bands = (job.height + job.band_rows - 1) // job.band_rows
-    if let deliver = target.sink:
-        # Row callbacks: every IDCT, then a few bands a thread at a time into one
-        # buffer, handed on in order.
-        try run_tasks(idct_task, (void*)job, d.mcuy, d.threads)
-        # The planes hold all the rows need: the coefficients go before the rows
-        # are handed on, which may take a while.
-        release_coefficients(d)
-        let per = d.threads * 2
-        let buffer = try new u8[per * job.band_rows * width * target.pixel] in memory.heap
-        defer free(buffer) in memory.heap
-        target.bytes = buffer
-        var band: usize = 0
-        while band < bands:
-            let count = per if band + per <= bands else bands - band
-            job.first_band = band
-            target.first_row = band * job.band_rows
-            try run_tasks(color_task, (void*)job, count, d.threads, width, column)
-            let first = band * job.band_rows
-            let last = first + count * job.band_rows if first + count * job.band_rows < job.height else job.height
-            try deliver(target.context, first, last - first, buffer[..<(last - first) * width * target.pixel])
-            band += count
-        return
     let s = try schedule_new(job, true)
     defer schedule_free(s)
     try run_tasks(schedule_task, (void*)s, 2 * d.mcuy, d.threads, width, column)
+
+## Render a completely read decoder to a row sink a group of MCU rows at a
+## time, as a streamed scan does: the IDCT into a ring of planes two MCU rows
+## longer than the group (a band's colour reads the rows either side), and
+## every band whose next row is in coloured and handed on. The planes stay a
+## few rows, whatever the picture; the coefficients go once all are made.
+func render_rows(d: Decoder*, target: Target*, deliver: RowSink) -> !:
+    let group = d.threads * 2 if d.threads > 1 else 2
+    let job = try plan(d, target, d.scale, group + 2)
+    defer free(job) in memory.heap
+    let width = job.width
+    let column = widest_plane(d)
+    let buffer = try new u8[(group + 1) * job.band_rows * width * target.pixel] in memory.heap
+    defer free(buffer) in memory.heap
+    target.bytes = buffer
+    let color_bands = (job.height + job.band_rows - 1) // job.band_rows
+    var made: usize = 0
+    var colored: usize = 0
+    while made < d.mcuy:
+        let count = group if made + group <= d.mcuy else d.mcuy - made
+        job.first_band = made
+        try run_tasks(idct_group_task, (void*)job, count, d.threads)
+        made += count
+        if made == d.mcuy:
+            release_coefficients(d)
+        let ready = made - 1 if made < d.mcuy else color_bands
+        let last_band = ready if ready < color_bands else color_bands
+        if last_band > colored:
+            job.first_band = colored
+            target.first_row = colored * job.band_rows
+            try run_tasks(color_task, (void*)job, last_band - colored, d.threads, width, column)
+            let first = colored * job.band_rows
+            let last = last_band * job.band_rows if last_band * job.band_rows < job.height else job.height
+            try deliver(target.context, first, last - first, buffer[..<(last - first) * width * target.pixel])
+            colored = last_band
+
+## A progressive picture's first sight: once every component has its DC
+## coefficients (the first scans), the picture at 1/8 size, straight from them,
+## to the decoder's coarse sink as RGBA; later scans refine what the rows show.
+func render_coarse(d: Decoder*) -> !:
+    d.coarse_done = true
+    let sink = d.coarse else return
+    let width = (d.width + 7) // 8
+    let height = (d.height + 7) // 8
+    let pixels = try new u8[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    var target = Target(bytes = pixels, pixel = 4)
+    let job = try plan(d, &target, 8)
+    defer free(job) in memory.heap
+    try run_tasks(idct_task, (void*)job, d.mcuy, d.threads)
+    let bands = (height + job.band_rows - 1) // job.band_rows
+    try run_tasks(color_task, (void*)job, bands, d.threads, width, widest_plane(d))
+    # Its planes go; the full render plans its own.
+    for i in 0..<d.count:
+        let c = &d.components[i]
+        if c.plane.length > 0:
+            free(c.plane) in memory.heap
+            var empty: u8[]
+            c.plane = empty
+    try sink(d.coarse_context, width, height, pixels)
+
+## Whether every component has had its first DC scan.
+func dc_ready(d: const Decoder*) -> bool:
+    for i in 0..<d.count:
+        if d.components[i].progression[0] == -1:
+            return false
+    return true
