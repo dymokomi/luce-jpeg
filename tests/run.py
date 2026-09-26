@@ -3,7 +3,7 @@
 and C modes against the fixtures:
 
 - every fixture decodes through the Raster API to exactly the samples of the
-  reference float decoder built the same way (tests/fixtures/golden.txt);
+  reference float decoder, on both backends (tests/fixtures/golden.txt);
 - decode_rgb8, decode_rgba8 and decode_rows give those same samples, on one
   thread and on several;
 - scaled decodes (1/2, 1/4, 1/8) have the scaled size, and with Pillow present
@@ -18,15 +18,15 @@ import hashlib, io, os, random, struct, subprocess, sys, tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BASE = (ROOT.parent / "luce-base/build/luce-base").resolve()
+BASE = Path(os.environ.get("LUCE_BASE", ROOT.parent / "luce-base/build/luce-base")).resolve()
 MODES = [["--native"], ["--backend=c"]]
 env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=str((ROOT.parent / "luce-base/src/std").resolve()))
 FIXTURES = sorted((ROOT / "tests/fixtures").glob("*.jpg"))
 GOLDEN = {}
 for line in (ROOT / "tests/fixtures/golden.txt").read_text().splitlines():
     if line and not line.startswith("#"):
-        native, c, name = line.split("  ")
-        GOLDEN[name] = {"--native": native, "--backend=c": c}
+        digest, name = line.split("  ")
+        GOLDEN[name] = digest
 # libjpeg replicates 3:1 and 4:1 chroma where this decoder interpolates.
 REPLICATED = {"s32.jpg", "s411.jpg"}
 
@@ -77,7 +77,7 @@ def check_drivers(tmp, flags):
         name = fixture.name
         if run([dump, fixture, raw]).returncode != 0:
             fail(f"{name}: the Raster decode failed")
-        if hashlib.sha256(raw.read_bytes()).hexdigest() != GOLDEN[name][flags[0]]:
+        if hashlib.sha256(raw.read_bytes()).hexdigest() != GOLDEN[name]:
             fail(f"{name}: Raster samples differ from the reference decoder")
         width, height, channels, samples = read_raw(raw)
         expected = as_rgb(channels, samples)
