@@ -104,6 +104,32 @@ pub func info(data: const u8[]) -> Info!:
             error(unsupported, "lossless or arithmetic JPEG is not supported")
     error(corrupt, "JPEG has no frame header")
 
+## Bytes of the start of a file, whose first `data.length` are `data`, through
+## its frame header: 0 when `data` holds it (or `info` will find there is none),
+## else how many it takes to go on. What `probe` needs of a file read in pieces.
+pub func head_bytes(data: const u8[]) -> usize!:
+    if data.length < 4:
+        return 4
+    if data[0] != 255 or data[1] != 216:
+        error(corrupt, "invalid JPEG signature")
+    var at: usize = 2
+    while true:
+        if at + 4 > data.length:
+            return at + 4
+        if data[at] != 255:
+            return 0
+        let code = data[at + 1]
+        if code == 255:
+            at += 1
+            continue
+        if code == 218 or code == 217:
+            return 0
+        let length = ((usize)data[at + 2] << 8) | (usize)data[at + 3]
+        if code >= 192 and code <= 207 and code != 196 and code != 200 and code != 204:
+            return 0 if at + 2 + length <= data.length else at + 2 + length
+        at += 2 + length
+    return 0
+
 ## Fill `image`'s size, channels (Y, or R G B for colour and CMYK) and format from
 ## its encoded bytes, ahead of `allocate` and `decode`.
 pub func probe(image: Raster*) -> !:

@@ -359,3 +359,26 @@ test "a baseline picture streams its rows a group of MCU rows at a time, as it d
             assert(rows.next == tall and rows.calls > 1)
             for i in 0..<wide * tall * 4:
                 assert(streamed[i] == whole[i])
+
+test "the start of a file through its frame header is what info needs":
+    var pixels: u8[64 * 48 * 4]
+    for index in 0..<pixels.length:
+        pixels[index] = (u8)(index * 5)
+    var out = Buffer()
+    defer out.close()
+    try encode_rgba8(pixels, 64, 48, &out)
+    let data = out.view()
+    var have: usize = 1
+    while true:
+        let need = try head_bytes(data[..<have])
+        if need == 0:
+            break
+        assert(need > have and need <= data.length)
+        have = need
+    let found = try info(data[..<have])
+    assert(found.width == 64 and found.height == 48)
+    var refused = false
+    discard(head_bytes(b"\x89PNG") catch failure:
+        refused = failure.code == corrupt
+        recover 0)
+    assert(refused)
