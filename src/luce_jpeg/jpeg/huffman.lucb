@@ -91,9 +91,26 @@ struct Bits:
     var acc: u64
     var bits: u32
     var padded: u32
+    ## The window a scan from a file reads through (jpeg/source).
+    var window: Window*?
 
     static func over(data: const u8[], position: usize) -> Bits:
-        return Bits(data = data.data, end = data.length, pos = position, acc = 0, bits = 0, padded = 0)
+        return Bits(data = data.data, end = data.length, pos = position, acc = 0, bits = 0, padded = 0, window = none)
+
+    ## A scan's reader from `position` in the decoder's data, through its window if any.
+    static func reading(d: const Decoder*, position: usize) -> Bits:
+        return Bits(data = d.data.data, end = d.data.length, pos = position, acc = 0, bits = 0, padded = 0, window = d.window)
+
+    ## Before an MCU of a scan from a file: the window slides on once less than
+    ## an MCU's worst is left, so no MCU reads past it.
+    mutating func keep_up() -> !:
+        let window = self.window else return
+        if self.end - self.pos >= window_margin or not window.more():
+            return
+        try window.slide(self.pos)
+        self.data = window.buffer.data
+        self.end = window.length
+        self.pos = 0
 
     ## Top up to at least 57 bits.
     mutating func fill():

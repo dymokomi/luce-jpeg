@@ -16,6 +16,8 @@ try jpeg.decode_rgb8(data, rgb, jpeg.Options(scale = 8))   # 1/8 size preview
 
 # Bands of rows, top to bottom, on the calling thread:
 try jpeg.decode_rows(data, sink, (void*)&state, layout = .rgba)
+# The same with the file read in pieces: read(context, offset, buffer) gives its bytes.
+try jpeg.decode_rows_at(read, (void*)&file, size, sink, (void*)&state)
 
 # The Raster route luce-image uses: f64 samples.
 try jpeg.probe(&raster)
@@ -25,6 +27,7 @@ try jpeg.decode(&raster)
 
 - `Options.scale` is 1, 2, 4 or 8. A scaled decode comes straight from the DCT: each output pixel is the mean of the full-size pixels it covers, before rounding, which is what libjpeg's reduced IDCTs compute in fixed point. Sizes round up (`info.scaled_width(scale)`).
 - `Options.threads` counts the caller's thread; 0 uses every processor.
+- `decode_rows_at` holds a megabyte window of the file, sliding on before each marker segment and, in a scan, between MCUs; restart intervals then decode on one thread.
 - Every route gives the same samples, bit for bit those of the plain float decoder in luce-jpeg 0.1 (exact f64 IDCT, bilinear "fancy" upsampling, f64 YCbCr).
 
 ## How it is fast

@@ -140,6 +140,7 @@ struct Cursor:
 func sequential_range(d: const Decoder*, scan: const Scan*, b: Bits*, cursor: Cursor*, first: usize, last: usize) -> !:
     let one = scan.count == 1
     for mcu in first..<last:
+        try b.keep_up()
         if d.restart > 0 and mcu != cursor.origin and mcu % d.restart == 0:
             try b.restart(cursor.expected)
             cursor.expected = next_restart(cursor.expected)
@@ -199,12 +200,12 @@ func sequential_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
     if splits(d, scan):
         if try parallel_intervals(d, scan, reader):
             return
-    var b = Bits.over(d.data, reader.position)
+    var b = Bits.reading(d, reader.position)
     var cursor = Cursor.at(d, 0)
     try sequential_range(d, scan, &b, &cursor, 0, total)
     if b.leftover():
         error(corrupt, "JPEG marker prefix missing")
-    reader.position = b.pos
+    resume_after(d, reader, &b)
 
 func check_tables(d: const Decoder*, scan: const Scan*) -> !:
     for i in 0..<scan.count:
@@ -214,7 +215,7 @@ func check_tables(d: const Decoder*, scan: const Scan*) -> !:
 
 ## Whether a sequential scan has enough restart intervals to split across threads.
 func splits(d: const Decoder*, scan: const Scan*) -> bool:
-    return d.threads > 1 and d.restart > 0 and scan.across * scan.down > d.restart * 2
+    return d.threads > 1 and d.restart > 0 and scan.across * scan.down > d.restart * 2 and d.window == none
 
 ## Decode a restart-coded scan on every processor. False, having done nothing,
 ## when the markers are not where the restart interval says: the sequential

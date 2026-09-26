@@ -76,6 +76,8 @@ struct Decoder:
     var rendered: bool
     ## A probed Raster the frame must match.
     var expected: const Raster*?
+    ## The file read in pieces (jpeg/source): `data` is what the window holds.
+    var window: Window*?
 
     mutating func close():
         if self.tables.length > 0:
@@ -103,7 +105,10 @@ struct Decoder:
         if try reader.uint(2) != 65496:
             error(corrupt, "invalid JPEG signature")
         var ended = false
-        while reader.position < reader.data.length:
+        while true:
+            try ensure_segment(&self, &reader)
+            if reader.position >= reader.data.length:
+                break
             let code = try marker(&reader)
             if code == 217:
                 ended = true

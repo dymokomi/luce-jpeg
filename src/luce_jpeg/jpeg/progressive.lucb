@@ -229,13 +229,14 @@ func progressive_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
         let c = &d.components[scan.selected[i]]
         if (ss == 0 and not refining and not d.tables[c.dc].present) or (ss > 0 and not d.tables[c.ac + 4].present):
             error(corrupt, "JPEG Huffman table missing")
-    var b = Bits.over(d.data, reader.position)
+    var b = Bits.reading(d, reader.position)
     var state = Progress()
     var predictors: i32[4]
     var expected: u8 = 208
     let one = scan.count == 1
     let total = scan.across * scan.down
     for mcu in 0..<total:
+        try b.keep_up()
         if mcu > 0 and d.restart > 0 and mcu % d.restart == 0:
             if state.eob != 0:
                 error(corrupt, "JPEG restart marker mismatch")
@@ -268,4 +269,4 @@ func progressive_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
         error(corrupt, "JPEG EOB run exceeds scan")
     if b.leftover():
         error(corrupt, "JPEG marker prefix missing")
-    reader.position = b.pos
+    resume_after(d, reader, &b)

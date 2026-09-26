@@ -352,7 +352,7 @@ func pipelined_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
     let s = try schedule_new(job, false)
     defer schedule_free(s)
     let crew = try crew_start(schedule_task, (void*)s, 2 * d.mcuy, d.threads, job.width, widest_plane(d))
-    var b = Bits.over(d.data, reader.position)
+    var b = Bits.reading(d, reader.position)
     var cursor = Cursor.at(d, 0)
     for row in 0..<scan.down:
         sequential_range(d, scan, &b, &cursor, row * scan.across, (row + 1) * scan.across) catch failure:
@@ -365,7 +365,7 @@ func pipelined_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
     try crew_finish(crew)
     if b.leftover():
         error(corrupt, "JPEG marker prefix missing")
-    reader.position = b.pos
+    resume_after(d, reader, &b)
     d.rendered = true
 
 ## Whether a scan streams to the row sink: the frame's one interleaved baseline
@@ -396,7 +396,7 @@ func streamed_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
     defer free(buffer) in memory.heap
     target.bytes = buffer
     let color_bands = (job.height + job.band_rows - 1) // job.band_rows
-    var b = Bits.over(d.data, reader.position)
+    var b = Bits.reading(d, reader.position)
     var cursor = Cursor.at(d, 0)
     var decoded: usize = 0
     var colored: usize = 0
@@ -421,7 +421,7 @@ func streamed_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
             colored = last_band
     if b.leftover():
         error(corrupt, "JPEG marker prefix missing")
-    reader.position = b.pos
+    resume_after(d, reader, &b)
     d.rendered = true
 
 func idct_group_task(context: void*, index: usize, scratch: Scratch*):

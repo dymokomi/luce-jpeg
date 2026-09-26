@@ -1,5 +1,6 @@
 ## Decodes one JPEG to 8-bit pixels at 1/scale through `decode_rgb8`, `decode_rgba8`
-## or `decode_rows`: `scaled <in.jpg> <out.raw> <scale> [rgb|rgba|rows] [threads]`,
+## or `decode_rows` (`at`: `decode_rows_at`, the file read in pieces):
+## `scaled <in.jpg> <out.raw> <scale> [rgb|rgba|rows|at] [threads]`,
 ## writing a 12-byte header (width, height, bytes a pixel as little-endian u32)
 ## then the pixel bytes.
 import files
@@ -21,6 +22,12 @@ func collect(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !
     collected.next_row = first + rows
     try collected.out.put(bytes)
 
+## `ReadAt` over an open file.
+func read_file(context: void*?, at: u64, into: u8[]) -> usize!:
+    let file = (files.File*)(context else return 0)
+    discard(try file.seek((i64)at))
+    return try file.read(into)
+
 pub func main(arguments: str[]) -> i32!:
     let encoded = try files.read((c.str)arguments[1])
     let scale = (usize)(strings.parse_u64(arguments[3]) else 1)
@@ -36,7 +43,15 @@ pub func main(arguments: str[]) -> i32!:
     try raw.uint((u64)height, 4)
     try raw.uint((u64)pixel, 4)
     let options = jpeg.Options(scale = scale, threads = threads)
-    if mode == "rows":
+    if mode == "at":
+        var file = try files.File.open((c.str)arguments[1])
+        defer file.destroy()
+        var collected = Collected(out = &raw, next_row = 0, failed = false)
+        try jpeg.decode_rows_at(read_file, (void*)&file, (u64)encoded.length, collect, (void*)&collected, layout = .rgb, options = options)
+        if collected.failed or collected.next_row != height:
+            print("rows out of order or missing")
+            return 1
+    elif mode == "rows":
         var collected = Collected(out = &raw, next_row = 0, failed = false)
         try jpeg.decode_rows(encoded, collect, (void*)&collected, layout = .rgb, options = options)
         if collected.failed or collected.next_row != height:

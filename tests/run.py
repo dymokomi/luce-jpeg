@@ -4,8 +4,8 @@ and C modes against the fixtures:
 
 - every fixture decodes through the Raster API to exactly the samples of the
   reference float decoder, on both backends (tests/fixtures/golden.txt);
-- decode_rgb8, decode_rgba8 and decode_rows give those same samples, on one
-  thread and on several;
+- decode_rgb8, decode_rgba8, decode_rows and decode_rows_at (the file read in
+  pieces) give those same samples, on one thread and on several;
 - scaled decodes (1/2, 1/4, 1/8) have the scaled size, and with Pillow present
   stay within 4 of libjpeg's reduced decodes, as full-size decodes stay within 4
   of libjpeg's (except 3:1 and 4:1 sampling, which libjpeg replicates);
@@ -81,7 +81,7 @@ def check_drivers(tmp, flags):
             fail(f"{name}: Raster samples differ from the reference decoder")
         width, height, channels, samples = read_raw(raw)
         expected = as_rgb(channels, samples)
-        for mode, threads in [("rgb", 1), ("rgba", 0), ("rows", 0), ("rgb", 3)]:
+        for mode, threads in [("rgb", 1), ("rgba", 0), ("rows", 0), ("rgb", 3), ("at", 0)]:
             if run([scaled, fixture, out, 1, mode, threads]).returncode != 0:
                 fail(f"{name}: {mode} decode on {threads} threads failed")
             w, h, pixel, pixels = read_raw(out)
@@ -102,6 +102,8 @@ def check_drivers(tmp, flags):
                 fail(f"{name}: 1/{scale} decode is {w}x{h}")
             if run([scaled, fixture, out, scale, "rows", 2]).returncode != 0 or read_raw(out)[3] != pixels:
                 fail(f"{name}: 1/{scale} rows differ from decode_rgb8")
+            if run([scaled, fixture, out, scale, "at", 2]).returncode != 0 or read_raw(out)[3] != pixels:
+                fail(f"{name}: 1/{scale} rows read in pieces differ from decode_rgb8")
             if Image:
                 size, ref = reference(fixture, scale)
                 # Pillow's draft cannot ask for every ceil-rounded size of tiny pictures.
@@ -126,13 +128,34 @@ def check_drivers(tmp, flags):
             cases.append(bytes(changed))
         for case in cases:
             (tmp / "bad.jpg").write_bytes(case)
-            for command in [[dump, tmp / "bad.jpg", raw], [scaled, tmp / "bad.jpg", out, 1, "rgba"], [scaled, tmp / "bad.jpg", out, 2, "rows"]]:
+            for command in [[dump, tmp / "bad.jpg", raw], [scaled, tmp / "bad.jpg", out, 1, "rgba"], [scaled, tmp / "bad.jpg", out, 2, "rows"], [scaled, tmp / "bad.jpg", out, 1, "at"]]:
                 result = run(command, capture_output=True)
                 if result.returncode not in (0, 1):
                     fail(f"{name}: a damaged file ended the process with {result.returncode}")
                 damaged += 1
     print(f"ok    {damaged} decodes of damaged files ended cleanly")
+    check_large(tmp, scaled)
     check_encoder(tmp, flags, scaled)
+
+
+def check_large(tmp, scaled):
+    """Files of several megabytes, whose windows slide many times, decode read in
+    pieces as they decode whole: baseline, restarts, progressive."""
+    if not Image:
+        print("skip  large files read in pieces: Pillow absent")
+        return
+    rng = random.Random(11)
+    picture = Image.frombytes("RGB", (1600, 1200), bytes(rng.randrange(256) for _ in range(1600 * 1200 * 3)))
+    out, whole = tmp / "out", tmp / "whole"
+    for name, options in [("baseline", {}), ("restart", {"restart_marker_blocks": 5}), ("progressive", {"progressive": True}),
+                          ("progressive restart", {"progressive": True, "restart_marker_blocks": 3, "subsampling": 2})]:
+        path = tmp / "large.jpg"
+        picture.save(path, "JPEG", quality=95, **options)
+        if run([scaled, path, whole, 1, "rows", 0]).returncode != 0 or run([scaled, path, out, 1, "at", 0]).returncode != 0:
+            fail(f"large {name}: does not decode")
+        if read_raw(out)[3] != read_raw(whole)[3]:
+            fail(f"large {name}: read in pieces differs from the file whole")
+    print("ok    large files read in pieces decode as the file whole")
 
 
 def check_encoder(tmp, flags, scaled):

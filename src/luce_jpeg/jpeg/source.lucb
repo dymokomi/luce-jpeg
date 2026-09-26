@@ -1,0 +1,102 @@
+#==============================================================================================
+#
+#   jpeg/source - Decoding from a file read in pieces
+#
+#   DESCRIPTION:
+#       `decode_rows` takes the file whole in memory; `decode_rows_at` reads it through a
+#       `ReadAt` into a `Window`, a block of the file that slides on as the decoder goes:
+#       before each marker segment (so the segment is in it whole) and, in a scan, between
+#       MCUs once less than `window_margin` is left, more than any MCU's coded bytes. The
+#       decoder's positions are into the window. Restart intervals then decode on one
+#       thread, since finding their markers would read the scan whole first.
+#
+#==============================================================================================
+
+## Reads bytes of a file at offset `at` into `into`: how many it read, fewer
+## only at the end of the file.
+pub type ReadAt = func(void*?, u64, u8[]) -> usize!
+
+## Bytes of the file a window holds.
+let window_bytes: usize = 1048576
+
+## What a scan must have ahead before an MCU: more than ten blocks' worst
+## coded size with every byte stuffed.
+let window_margin: usize = 65536
+
+## A block of a file, sliding on through it.
+struct Window:
+    var read: ReadAt
+    var source: void*?
+    var size: u64
+    var buffer: u8[]
+    ## Where the buffer starts in the file, and the bytes in it.
+    var at: u64
+    var length: usize
+
+    static func open(read: ReadAt, source: void*?, size: u64) -> Window!:
+        var window = Window(read = read, source = source, size = size, buffer = try alloc u8[window_bytes] in memory.heap, at = 0, length = 0)
+        window.fill() catch failure:
+            window.close()
+            error(failure.code, failure.message)
+        return window
+
+    mutating func close():
+        if self.buffer.length > 0:
+            free(self.buffer) in memory.heap
+        var empty: u8[]
+        self.buffer = empty
+
+    ## The bytes held.
+    func view() -> const u8[]:
+        return self.buffer[..<self.length]
+
+    ## Whether the file goes on past what is held.
+    func more() -> bool:
+        return self.at + (u64)self.length < self.size
+
+    ## Read on until the buffer is full or the file ends.
+    mutating func fill() -> !:
+        while self.length < self.buffer.length and self.more():
+            let count = try self.read(self.source, self.at + (u64)self.length, self.buffer[self.length..])
+            if count == 0:
+                error(corrupt, "the JPEG file ended early")
+            self.length += count
+
+    ## Drop the first `keep_from` bytes held, move the rest to the start and
+    ## read on; positions into the window go back by `keep_from`.
+    mutating func slide(keep_from: usize) -> !:
+        let rest = self.length - keep_from
+        memory.move(self.buffer, self.buffer[keep_from..<self.length], rest)
+        self.at += (u64)keep_from
+        self.length = rest
+        try self.fill()
+
+## Decode the `size`-byte JPEG file `read` gives in bands of whole rows, each
+## handed to `sink` with `context`, as `decode_rows` does from memory.
+pub func decode_rows_at(read: ReadAt, source: void*?, size: u64, sink: RowSink, context: void*?, layout: Layout = .rgba, options: Options = Options()) -> !:
+    try check_scale(options.scale)
+    var window = try Window.open(read, source, size)
+    defer window.close()
+    var target = Target(pixel = 4 if layout == .rgba else 3, sink = sink, context = context)
+    var d = Decoder(data = window.view(), max_bytes = options.max_bytes, requested = options.threads, target = &target, scale = options.scale, window = &window)
+    defer d.close()
+    try d.decode()
+
+## A marker segment of up to 64 KiB wholly in the window from `reader`'s
+## position: the window slides on when less is left.
+func ensure_segment(d: Decoder*, reader: Reader*) -> !:
+    let window = d.window else return
+    if reader.data.length - reader.position >= 65540 or not window.more():
+        return
+    try window.slide(reader.position)
+    d.data = window.view()
+    reader.data = d.data
+    reader.position = 0
+
+## After a scan read through `b`: the decoder and `reader` over the window as
+## the scan left it, at the scan's end.
+func resume_after(d: Decoder*, reader: Reader*, b: const Bits*):
+    if let window = b.window:
+        d.data = window.view()
+        reader.data = d.data
+    reader.position = b.pos

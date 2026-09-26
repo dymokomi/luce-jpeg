@@ -13,8 +13,8 @@
 #       straight from the DCT, as libjpeg's scale_denom does.
 #
 #       Output goes to 8-bit RGBA or RGB bytes (`decode_rgba8`, `decode_rgb8`), to a
-#       row callback in top-to-bottom bands (`decode_rows`), or to a Raster's f64
-#       samples (`probe` then `decode`). Every route produces the same sample values,
+#       row callback in top-to-bottom bands (`decode_rows`, or `decode_rows_at` reading
+#       the file in pieces), or to a Raster's f64 samples (`probe` then `decode`). Every route produces the same sample values,
 #       bit for bit those of the plain float decoder this one replaced.
 #
 #       Encoding takes 8-bit RGBA, RGB or gray rows at once (`encode_rgba8`...) or
@@ -30,6 +30,7 @@
 #       idct.lucb         the exact separable IDCT, full size and DCT-scaled
 #       color.lucb        upsampling and colour conversion of one output row
 #       render.lucb       the worker crew, render geometry, the band schedule, targets
+#       source.lucb       decoding from a file read in pieces (`decode_rows_at`)
 #       encode.lucb       the encoder's API, band orchestration and file header
 #       encode_transform.lucb  colour conversion, downsampling, the quantized AAN DCT
 #       encode_entropy.lucb    Huffman tables, optimal tables, bit streams and joining

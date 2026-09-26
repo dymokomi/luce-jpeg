@@ -6,6 +6,7 @@ progressive.lucb
 idct.lucb
 color.lucb
 render.lucb
+source.lucb
 encode.lucb
 encode_transform.lucb
 encode_entropy.lucb
