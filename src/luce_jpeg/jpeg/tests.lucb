@@ -300,3 +300,62 @@ test "the encoder refuses bad requests":
         refused = failure.code == invalid
         recover ()
     assert(refused)
+
+## Rows kept in one picture of `width` pixels, checked in order.
+struct Streamed:
+    var pixels: u8[]
+    var width: usize
+    var pixel: usize
+    var next: usize
+    var calls: usize
+
+func keep_streamed(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
+    let into = (Streamed*)(context else return)
+    if first != into.next or bytes.length != rows * into.width * into.pixel:
+        error(invalid, "rows out of order")
+    memory.copy(into.pixels[first * into.width * into.pixel..], bytes, bytes.length)
+    into.next = first + rows
+    into.calls += 1
+
+test "a baseline picture streams its rows a group of MCU rows at a time, as it decodes whole":
+    # Tall enough for many groups at any thread count; every subsampling, a
+    # restart interval, gray, and a scaled decode.
+    let width: usize = 301
+    let height: usize = 1700
+    let pixels = try alloc u8[width * height * 4] in memory.heap
+    defer free(pixels) in memory.heap
+    for y in 0..<height:
+        for x in 0..<width:
+            let at = (y * width + x) * 4
+            pixels[at] = (u8)((x * 5 + y) % 256)
+            pixels[at + 1] = (u8)((y * 3 + x * x // 7) % 256)
+            pixels[at + 2] = (u8)(((x + y) // 11) * 13 % 256)
+            pixels[at + 3] = 255
+    let gray = try alloc u8[width * height] in memory.heap
+    defer free(gray) in memory.heap
+    for i in 0..<gray.length:
+        gray[i] = pixels[i * 4 + 1]
+    let whole = try alloc u8[width * height * 4] in memory.heap
+    defer free(whole) in memory.heap
+    let streamed = try alloc u8[width * height * 4] in memory.heap
+    defer free(streamed) in memory.heap
+    for case in 0..<(usize)6:
+        var encoded = Buffer()
+        defer encoded.close()
+        if case == 4:
+            try encode_gray8(gray, width, height, &encoded)
+        else:
+            let sampling = Subsampling.s444 if case == 0 else Subsampling.s422 if case == 1 else Subsampling.s420
+            try encode_rgba8(pixels, width, height, &encoded, EncodeOptions(subsampling = sampling, restart = case == 3))
+        let scale: usize = 2 if case == 5 else 1
+        let options = Options(scale = scale)
+        let wide = (width + scale - 1) // scale
+        let tall = (height + scale - 1) // scale
+        for threads in [(usize)1, 0]:
+            let chosen = Options(scale = scale, threads = threads)
+            try decode_rgba8(encoded.view(), whole[..<wide * tall * 4], options)
+            var rows = Streamed(pixels = streamed, width = wide, pixel = 4, next = 0, calls = 0)
+            try decode_rows(encoded.view(), keep_streamed, (void*)&rows, options = chosen)
+            assert(rows.next == tall and rows.calls > 1)
+            for i in 0..<wide * tall * 4:
+                assert(streamed[i] == whole[i])

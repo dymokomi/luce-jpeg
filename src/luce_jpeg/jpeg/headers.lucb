@@ -21,7 +21,9 @@ struct Component:
     var actual_bx: usize
     var actual_by: usize
     ## Quantized coefficients, 64 a block in natural order, blocks row after row.
+    ## A streamed scan keeps a ring of `ring` block rows instead (0: every row).
     var coefficients: i16[]
+    var ring: usize
     ## Progressive frames: each block's nonzero AC coefficients by zigzag index.
     var nonzero: u64[]
     ## The successive-approximation bit each coefficient was last coded to, -1 before any.
@@ -29,8 +31,10 @@ struct Component:
     ## The IDCT's output block size: 8 at full size, fewer when DCT-scaled.
     var out_w: usize
     var out_h: usize
-    ## IDCT output: bx * out_w samples across (the stride), by * out_h down.
+    ## IDCT output: bx * out_w samples across (the stride), by * out_h down; a
+    ## streamed scan's is a ring of `plane_ring` rows (0: every row).
     var plane: u8[]
+    var plane_ring: usize
     var stride: usize
     var rows: usize
     ## Plane samples that cover the picture, the limit of upsampling's edge clamp.
@@ -119,9 +123,12 @@ struct Decoder:
                 let header = try scan_header(&self, &s)
                 if self.progressive:
                     try progressive_scan(&self, &header, &reader)
+                elif streams(&self, &header):
+                    try streamed_scan(&self, &header, &reader)
                 elif pipelines(&self, &header):
                     try pipelined_scan(&self, &header, &reader)
                 else:
+                    try self.whole_coefficients()
                     try sequential_scan(&self, &header, &reader)
             elif code == 238 and s.data.length >= 12 and (str)s.data[..<5] == "Adobe":
                 self.adobe = (i32)s.data[11]
@@ -187,11 +194,28 @@ struct Decoder:
             allocated += coefficients * 3 + (coefficients // 8 if self.progressive else 0)
             if allocated > self.max_bytes:
                 error(limit, "JPEG coefficient and sample buffers exceed byte limit")
-            c.coefficients = try new i16[coefficients] in memory.heap
+            # A baseline picture going to a row sink may stream (render/streamed_scan):
+            # its coefficients wait for the scan to say whether it does.
+            if not self.progressive and self.to_sink():
+                c.ring = 0
+            else:
+                c.coefficients = try new i16[coefficients] in memory.heap
             if self.progressive:
                 c.nonzero = try new u64[c.bx * c.by] in memory.heap
             for k in 0..<64:
                 c.progression[k] = -1
+
+    ## Whether rows go to a sink rather than into a buffer.
+    func to_sink() -> bool:
+        let target = self.target else return false
+        return target.sink != none
+
+    ## Coefficients for every block, where a streamed scan left them unmade.
+    mutating func whole_coefficients() -> !:
+        for i in 0..<self.count:
+            let c = &self.components[i]
+            if c.coefficients.length == 0:
+                c.coefficients = try new i16[c.bx * c.by * 64] in memory.heap
 
     mutating func quantization(s: Reader*) -> !:
         while s.position < s.data.length:

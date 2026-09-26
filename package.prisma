@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-jpeg" {
     str owner = "dymokomi"
-    str version = "0.3.0"
+    str version = "0.3.1"
     str kind = "package"
     str language = "luce-base"
     str description = "Fast multithreaded JPEG for Luce/Base: baseline and progressive decoding (8-bit, row bands, 1/2-1/8 scaled) and baseline encoding (4:4:4/4:2:2/4:2:0, restarts, optimized tables, streamed rows)."

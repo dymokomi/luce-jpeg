@@ -13,8 +13,12 @@
 #       entropy-decodes MCU rows while the workers render the rows it has finished, so
 #       nearly all of the rendering hides behind the entropy decoding.
 #
-#       Row callbacks render in groups of bands into one buffer after decoding and hand
-#       each group on in order.
+#       Row callbacks from the frame's one interleaved baseline scan stream: the calling
+#       thread entropy-decodes a group of MCU rows into a ring of coefficients, the workers
+#       transform and colour them, and the rows go to the callback before the next group
+#       is decoded, so the first rows arrive at once and a few MCU rows are all it holds.
+#       Other row callbacks render in groups of bands into one buffer after decoding and
+#       hand each group on in order.
 #
 #==============================================================================================
 
@@ -148,7 +152,7 @@ struct RenderJob:
 
 ## Plan the planes for a decode at 1/`scale` and set up its job: each component's
 ## IDCT output size, its plane, and its sampling ratio against output pixels.
-func plan(d: Decoder*, target: const Target*, scale: usize) -> RenderJob*!:
+func plan(d: Decoder*, target: const Target*, scale: usize, ring: usize = 0) -> RenderJob*!:
     let n = 8 // scale
     let width = (d.width + scale - 1) // scale
     let height = (d.height + scale - 1) // scale
@@ -177,12 +181,17 @@ func plan(d: Decoder*, target: const Target*, scale: usize) -> RenderJob*!:
         # more than two samples and the scale is above 1/8, else replication.
         let halves = (c.num_x == c.den_x or c.num_x * 2 == c.den_x) and (c.num_y == c.den_y or c.num_y * 2 == c.den_y)
         c.replicate = scale > 1 and (c.num_x != c.den_x or c.num_y != c.den_y) and (scale == 8 or not halves or c.valid_w <= 2)
-        allocated += c.stride * c.rows
+        # A streamed scan's plane is a ring of `ring` MCU rows.
+        c.plane_ring = ring * c.vertical * c.out_h
+        let plane_rows = c.rows if ring == 0 or c.plane_ring > c.rows else c.plane_ring
+        if ring > 0:
+            c.plane_ring = plane_rows
+        allocated += c.stride * plane_rows
         if allocated > d.max_bytes:
             error(limit, "JPEG coefficient and sample buffers exceed byte limit")
         if c.plane.length > 0:
             free(c.plane) in memory.heap
-        c.plane = try alloc u8[c.stride * c.rows] in memory.heap
+        c.plane = try alloc u8[c.stride * plane_rows] in memory.heap
     let job = try new RenderJob(d = d, target = target, cosines = Cosines.make(), width = width, height = height, band_rows = d.max_v * n, first_band = 0) in memory.heap
     for i in 0..<(usize)256:
         job.quant[i] = (f64)d.quant[i]
@@ -207,7 +216,7 @@ func idct_band(job: const RenderJob*, band: usize):
         let plane = c.plane.data
         for by in band * c.vertical..<(band + 1) * c.vertical:
             for bx in 0..<c.bx:
-                idct_block(coefficients + (by * c.bx + bx) * 64, quant, across, down, c.out_w, c.out_h, plane + by * c.out_h * c.stride + bx * c.out_w, c.stride)
+                idct_block(coefficients + (block_row(c, by) * c.bx + bx) * 64, quant, across, down, c.out_w, c.out_h, plane + plane_row(c, by * c.out_h) * c.stride + bx * c.out_w, c.stride)
 
 func idct_task(context: void*, band: usize, scratch: Scratch*):
     idct_band((RenderJob*)context, band)
@@ -359,6 +368,79 @@ func pipelined_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
     reader.position = b.pos
     d.rendered = true
 
+## Whether a scan streams to the row sink: the frame's one interleaved baseline
+## scan, its coefficients not made whole already by an earlier scan.
+func streams(d: const Decoder*, scan: const Scan*) -> bool:
+    if d.progressive or not d.to_sink() or scan.count != d.count or d.components[0].coefficients.length > 0:
+        return false
+    return d.count > 1 or (d.components[0].horizontal == 1 and d.components[0].vertical == 1)
+
+## Decode a streaming scan a group of MCU rows at a time: coefficients into a
+## ring of the group's rows, transformed into a ring of planes two MCU rows
+## longer (a band's colour reads the rows either side), and every band whose
+## next row is in coloured and handed on.
+func streamed_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
+    try check_tables(d, scan)
+    let target = d.target else trap("a streamed scan has a target")
+    let deliver = target.sink else trap("a streamed scan has a sink")
+    let group = d.threads * 2 if d.threads > 1 else 2
+    for i in 0..<d.count:
+        let c = &d.components[i]
+        c.ring = group * (1 if scan.count == 1 else c.vertical)
+        c.coefficients = try new i16[c.ring * c.bx * 64] in memory.heap
+    let job = try plan(d, target, d.scale, group + 2)
+    defer free(job) in memory.heap
+    let width = job.width
+    let column = widest_plane(d)
+    let buffer = try new u8[(group + 1) * job.band_rows * width * target.pixel] in memory.heap
+    defer free(buffer) in memory.heap
+    target.bytes = buffer
+    let color_bands = (job.height + job.band_rows - 1) // job.band_rows
+    var b = Bits.over(d.data, reader.position)
+    var cursor = Cursor.at(d, 0)
+    var decoded: usize = 0
+    var colored: usize = 0
+    while decoded < scan.down:
+        let count = group if decoded + group <= scan.down else scan.down - decoded
+        # Blocks decode into zeroed coefficients.
+        for i in 0..<d.count:
+            memory.set(u8[]((u8*)d.components[i].coefficients.data, d.components[i].coefficients.length * 2), 0)
+        try sequential_range(d, scan, &b, &cursor, decoded * scan.across, (decoded + count) * scan.across)
+        job.first_band = decoded
+        try run_tasks(idct_group_task, (void*)job, count, d.threads)
+        decoded += count
+        let ready = decoded - 1 if decoded < scan.down else color_bands
+        let last_band = ready if ready < color_bands else color_bands
+        if last_band > colored:
+            job.first_band = colored
+            target.first_row = colored * job.band_rows
+            try run_tasks(color_task, (void*)job, last_band - colored, d.threads, width, column)
+            let first = colored * job.band_rows
+            let last = last_band * job.band_rows if last_band * job.band_rows < job.height else job.height
+            try deliver(target.context, first, last - first, buffer[..<(last - first) * width * target.pixel])
+            colored = last_band
+    if b.leftover():
+        error(corrupt, "JPEG marker prefix missing")
+    reader.position = b.pos
+    d.rendered = true
+
+func idct_group_task(context: void*, index: usize, scratch: Scratch*):
+    let job = (RenderJob*)context
+    idct_band(job, job.first_band + index)
+
+## Free the components' coefficients once every IDCT is done.
+func release_coefficients(d: Decoder*):
+    for i in 0..<d.count:
+        let c = &d.components[i]
+        if c.coefficients.length > 0:
+            free(c.coefficients) in memory.heap
+            var empty: i16[]
+            c.coefficients = empty
+        if c.nonzero.length > 0:
+            free(c.nonzero) in memory.heap
+            var none_left: u64[]
+            c.nonzero = none_left
+
 ## Render a completely read decoder into its target.
 func render(d: Decoder*) -> !:
     let target = d.target else trap("render without a target")
@@ -371,6 +453,9 @@ func render(d: Decoder*) -> !:
         # Row callbacks: every IDCT, then a few bands a thread at a time into one
         # buffer, handed on in order.
         try run_tasks(idct_task, (void*)job, d.mcuy, d.threads)
+        # The planes hold all the rows need: the coefficients go before the rows
+        # are handed on, which may take a while.
+        release_coefficients(d)
         let per = d.threads * 2
         let buffer = try new u8[per * job.band_rows * width * target.pixel] in memory.heap
         defer free(buffer) in memory.heap

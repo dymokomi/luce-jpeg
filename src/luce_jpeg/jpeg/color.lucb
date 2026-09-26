@@ -20,7 +20,7 @@
 ## scratch for a vertically interpolated plane row, at least the plane's stride.
 func component_row(c: const Component*, y: usize, width: usize, row: f64*, column: i32*):
     if c.replicate:
-        let line = c.plane.data + y * c.num_y // c.den_y * c.stride
+        let line = c.plane.data + plane_row(c, y * c.num_y // c.den_y) * c.stride
         for x in 0..<width:
             row[x] = (f64)line[x * c.num_x // c.den_x]
         return
@@ -38,8 +38,8 @@ func component_row(c: const Component*, y: usize, width: usize, row: f64*, colum
         r0 = s >> 2
         fy = (i32)(s & 3)
     let r1 = r0 + 1 if r0 + 1 < c.rows else r0
-    let p0 = c.plane.data + r0 * c.stride
-    let p1 = c.plane.data + r1 * c.stride
+    let p0 = c.plane.data + plane_row(c, r0) * c.stride
+    let p1 = c.plane.data + plane_row(c, r1) * c.stride
     if c.num_x == c.den_x:
         if fy == 0:
             for x in 0..<width:
@@ -67,6 +67,10 @@ func component_row(c: const Component*, y: usize, width: usize, row: f64*, colum
         row[x] = last
         x += 1
 
+## Where plane row `row` of `c` sits: a streamed scan's plane is a ring.
+inline func plane_row(c: const Component*, row: usize) -> usize:
+    return row if c.plane_ring == 0 else row % c.plane_ring
+
 ## 2:1 upsampling's source position of output `x` in quarter samples,
 ## 2x - 1 clamped to 0..4 * (valid - 1).
 inline func clamp_quarter(x: usize, valid: usize) -> usize:
@@ -87,8 +91,10 @@ func interpolate(c: const Component*, x: usize, y: usize) -> f64:
     let fx = sx - (f64)x0
     let fy = sy - (f64)y0
     let p = c.plane.data
-    let a = (f64)p[y0 * c.stride + x0] * (1.0 - fx) + (f64)p[y0 * c.stride + x1] * fx
-    let b = (f64)p[y1 * c.stride + x0] * (1.0 - fx) + (f64)p[y1 * c.stride + x1] * fx
+    let top = plane_row(c, y0) * c.stride
+    let bottom = plane_row(c, y1) * c.stride
+    let a = (f64)p[top + x0] * (1.0 - fx) + (f64)p[top + x1] * fx
+    let b = (f64)p[bottom + x0] * (1.0 - fx) + (f64)p[bottom + x1] * fx
     return a * (1.0 - fy) + b * fy
 
 ## Rounded to the nearest 8-bit value: floor(clamp(v, 0, 255) + 0.5).

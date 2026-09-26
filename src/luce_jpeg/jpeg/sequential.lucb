@@ -155,8 +155,13 @@ func sequential_range(d: const Decoder*, scan: const Scan*, b: Bits*, cursor: Cu
             let base = c.coefficients.data
             for y in 0..<vertical:
                 for x in 0..<horizontal:
-                    let block = ((my * vertical + y) * c.bx + mx * horizontal + x) * 64
+                    let block = (block_row(c, my * vertical + y) * c.bx + mx * horizontal + x) * 64
                     try sequential_block(b, dc, ac, &cursor.predictors[i], base + block)
+
+## Where block row `row` of `c` sits in its coefficients: a streamed scan's
+## are a ring.
+inline func block_row(c: const Component*, row: usize) -> usize:
+    return row if c.ring == 0 else row % c.ring
 
 ## One slice of a restart-split scan: whole intervals, decoded on a worker.
 struct IntervalJob:
