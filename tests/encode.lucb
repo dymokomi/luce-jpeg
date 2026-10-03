@@ -3,7 +3,7 @@
 ## [444|422|420] [flags] [threads]`, flags a mix of `r` (restart markers) and `o`
 ## (optimized tables), or `-`. `stream` pushes RGBA rows 100 at a time through an
 ## Encoder. The last encoding is written out.
-import luce_std.files
+from luce_std import files
 import c
 import time
 import memory

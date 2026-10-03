@@ -1,6 +1,6 @@
 ## Times decoding one file: `bench <file.jpg> [repeats] [raster|rgba|rgb|rows] [scale] [threads]`.
 ## Prints each run and the best, in milliseconds.
-import luce_std.files
+from luce_std import files
 import c
 import time
 import memory

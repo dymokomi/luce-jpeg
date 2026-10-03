@@ -38,7 +38,7 @@
 #
 #==============================================================================================
 import memory
-import luce_std.math
+from luce_std import math
 import thread
 import os
 import sync

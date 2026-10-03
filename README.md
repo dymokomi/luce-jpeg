@@ -7,7 +7,7 @@ Split out of luce-image on 2026-09-22 so every file format is its own package, l
 ## Decoding
 
 ```luce
-import luce_jpeg.jpeg
+from luce_jpeg import jpeg
 
 let found = try jpeg.info(data)                     # width, height, components, progressive
 let pixels = try alloc u8[found.width * found.height * 4]

@@ -4,7 +4,7 @@
 ## `coarse` writing a progressive picture's first sight (1/8, RGBA) instead,
 ## writing a 12-byte header (width, height, bytes a pixel as little-endian u32)
 ## then the pixel bytes.
-import luce_std.files
+from luce_std import files
 import c
 import memory
 import strings
