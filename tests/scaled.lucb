@@ -4,12 +4,12 @@
 ## `coarse` writing a progressive picture's first sight (1/8, RGBA) instead,
 ## writing a 12-byte header (width, height, bytes a pixel as little-endian u32)
 ## then the pixel bytes.
-import files
+import luce_std.files
 import c
 import memory
 import strings
 import jpeg
-from binary import Buffer
+from luce_raster.binary import Buffer
 
 struct Collected:
     var out: Buffer*

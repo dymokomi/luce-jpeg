@@ -1,12 +1,12 @@
 ## Times decoding one file: `bench <file.jpg> [repeats] [raster|rgba|rgb|rows] [scale] [threads]`.
 ## Prints each run and the best, in milliseconds.
-import files
+import luce_std.files
 import c
 import time
 import memory
 import strings
 import jpeg
-from raster import Raster
+from luce_raster.model import Raster
 
 func discard_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
     let total = (u64*)(context else return)

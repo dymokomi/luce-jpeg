@@ -1,25 +1,22 @@
 #prisma 4.0
 def package "luce-jpeg" {
     str owner = "dymokomi"
-    str version = "0.4.1"
+    str version = "0.5.0"
     str kind = "package"
     str language = "luce-base"
     str description = "Fast multithreaded JPEG for Luce/Base: baseline and progressive decoding (8-bit, row bands, 1/2-1/8 scaled) and baseline encoding (4:4:4/4:2:2/4:2:0, restarts, optimized tables, streamed rows)."
     str readme = "README.md"
+    str[] public = ["jpeg"]
 
     def dependency "luce-raster" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-raster"
-    }
-
-    def export "jpeg" {
-        str module = "luce_jpeg.jpeg"
     }
 
     def dependency "luce-std" {
         str owner = "dymokomi"
-        str version = "^0.1.0"
+        str version = "^0.2.0"
         str path = "../luce-std"
     }
 }

@@ -248,7 +248,7 @@ def check_encoder(tmp, flags, scaled):
 
 
 for flags in MODES:
-    run([BASE, "test", ROOT / "src/luce_jpeg/jpeg", *flags], check=True)
+    run([BASE, "test", ROOT / "src/jpeg", *flags], check=True)
     with tempfile.TemporaryDirectory(prefix="luce-jpeg-") as tmp:
         check_drivers(Path(tmp), flags)
 print("PASS luce-jpeg")
