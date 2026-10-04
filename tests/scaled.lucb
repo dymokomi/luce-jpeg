@@ -46,7 +46,9 @@ func read_file(context: void*?, at: u64, into: u8[]) -> usize!:
     return try file.read(into)
 
 pub func main(arguments: str[]) -> i32!:
-    let encoded = try files.read((c.str)arguments[1])
+    let encoded_file = try files.read((c.str)arguments[1])
+    defer encoded_file.release()
+    let encoded = encoded_file.value
     let scale = (usize)(strings.parse_u64(arguments[3]) else 1)
     let mode = arguments[4] if arguments.length > 4 else "rgb"
     let threads = (usize)(strings.parse_u64(arguments[5]) else 0) if arguments.length > 5 else 0

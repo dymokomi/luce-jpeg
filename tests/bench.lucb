@@ -13,7 +13,12 @@ func discard_rows(context: void*?, first: usize, rows: usize, bytes: const u8[])
     *total += (u64)bytes.length
 
 pub func main(arguments: str[]) -> i32!:
-    let encoded = try files.read((c.str)arguments[1])
+    let file = try files.read((c.str)arguments[1])
+    defer file.release()
+    # A raster holds mutable bytes, so the benchmark lends it a copy.
+    let encoded = try alloc u8[file.value.length] in memory.heap
+    defer free(encoded) in memory.heap
+    memory.copy(encoded, file.value, file.value.length)
     let repeats = (usize)(strings.parse_u64(arguments[2]) else 1) if arguments.length > 2 else 1
     let mode = arguments[3] if arguments.length > 3 else "raster"
     let scale = (usize)(strings.parse_u64(arguments[4]) else 1) if arguments.length > 4 else 1
