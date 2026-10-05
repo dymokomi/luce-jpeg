@@ -10,7 +10,7 @@ Split out of luce-image on 2026-09-22 so every file format is its own package, l
 from luce_jpeg import jpeg
 
 let found = try jpeg.info(data)                     # width, height, components, progressive
-let pixels = try alloc u8[found.width * found.height * 4]
+let pixels = try new u8[found.width * found.height * 4] ---
 try jpeg.decode_rgba8(data, pixels)                 # 8-bit RGBA, alpha 255, every processor
 try jpeg.decode_rgb8(data, rgb, jpeg.Options(scale = 8))   # 1/8 size preview
 

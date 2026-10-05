@@ -122,7 +122,7 @@ struct Decoder:
     var coarse_context: void*?
     var coarse_done: bool
 
-    mutating func close():
+    func close():
         if self.tables.length > 0:
             free(self.tables) in memory.heap
         for i in 0..<self.count:
@@ -134,14 +134,14 @@ struct Decoder:
 
     ## Read every marker segment through the end of image, entropy-decoding each scan
     ## into the components' coefficients, then render them into `target`.
-    mutating func decode() -> !:
+    func decode() -> !:
         try self.read()
         if not self.rendered:
             try render(&self)
 
     ## Read every marker segment through the end of image, entropy-decoding each scan
     ## into the components' coefficients (and rendering a pipelined scan's rows).
-    mutating func read() -> !:
+    func read() -> !:
         self.tables = try new Huffman[8] in memory.heap
         var reader = Reader(data = self.data, little = false)
         if try reader.uint(2) != 65496:
@@ -190,7 +190,7 @@ struct Decoder:
             if not self.quant_present[c.quant] or c.progression[0] == -1:
                 error(corrupt, "JPEG component lacks quantization or DC scan")
 
-    mutating func frame(h: Reader*, code: u8) -> !:
+    func frame(h: Reader*, code: u8) -> !:
         if self.count != 0:
             error(corrupt, "multiple JPEG frame headers")
         if try h.byte() != 8:
@@ -259,13 +259,13 @@ struct Decoder:
         return target.sink != none
 
     ## Coefficients for every block, where a streamed scan left them unmade.
-    mutating func whole_coefficients() -> !:
+    func whole_coefficients() -> !:
         for i in 0..<self.count:
-            let c = &self.components[i]
+            let c: Component* = &self.components[i]
             if c.bands.length == 0:
                 try allocate_bands(c, self.mcuy)
 
-    mutating func quantization(s: Reader*) -> !:
+    func quantization(s: Reader*) -> !:
         while s.position < s.data.length:
             let selector = try s.byte()
             let index = (usize)(selector & 15)
@@ -279,7 +279,7 @@ struct Decoder:
                 self.quant[index * 64 + zigzag[i]] = (u32)value
             self.quant_present[index] = true
 
-    mutating func huffman(s: Reader*) -> !:
+    func huffman(s: Reader*) -> !:
         while s.position < s.data.length:
             let selector = try s.byte()
             if (selector >> 4) > 1 or (selector & 15) > 3:

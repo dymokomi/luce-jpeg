@@ -33,7 +33,7 @@ struct CodeTable:
     var size: u8[256]
 
     ## A table from code counts by length and symbols in code order.
-    static func make(counts: const u8[], values: const u8[]) -> CodeTable:
+    func make(counts: const u8[], values: const u8[]) -> CodeTable:
         var table = CodeTable()
         var code: u32 = 0
         var k: usize = 0
@@ -148,13 +148,13 @@ struct BitBuffer:
     var failed: bool
 
     ## Room for `count` more words.
-    mutating func ensure(count: usize) -> bool:
+    func ensure(count: usize) -> bool:
         if self.used + count <= self.words.length:
             return true
         var capacity = self.words.length * 2
         if capacity < self.used + count:
             capacity = self.used + count + 1024
-        let grown = alloc u32[capacity] in memory.heap catch:
+        let grown = new u32[capacity] --- in memory.heap catch:
             self.failed = true
             return false
         memory.copy(grown, self.words, self.used)
@@ -163,13 +163,13 @@ struct BitBuffer:
         self.words = grown
         return true
 
-    mutating func reset():
+    func reset():
         self.used = 0
         self.acc = 0
         self.bits = 0
         self.failed = false
 
-    mutating func close():
+    func close():
         if self.words.length > 0:
             free(self.words) in memory.heap
         self = BitBuffer()
@@ -272,7 +272,7 @@ struct Stuffer:
     var bits: u32
 
     ## `count` bits (at most 32) of `value`; the caller has reserved room.
-    mutating func put(value: u64, count: u32):
+    func put(value: u64, count: u32):
         var acc = (self.acc << (u64)count) | value
         var bits = self.bits + count
         let data = self.out.data.data
@@ -290,12 +290,12 @@ struct Stuffer:
         self.bits = bits
 
     ## Pad to a byte with ones.
-    mutating func align():
+    func align():
         if self.bits > 0:
             self.put(((u64)1 << (u64)(8 - self.bits)) - 1, 8 - self.bits)
 
     ## A band's stream: its words, then its unfinished last word.
-    mutating func append(band: const BitBuffer*):
+    func append(band: const BitBuffer*):
         let words = band.words.data
         for i in 0..<band.used:
             self.put((u64)words[i], 32)

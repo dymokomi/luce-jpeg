@@ -178,9 +178,9 @@ test "bad requests and bad data fail cleanly":
             recover ()
         assert(refused)
     refused = false
-    discard(info(b"not a jpeg at all") catch failure:
+    _ = info(b"not a jpeg at all") catch failure:
         refused = failure.code == corrupt
-        recover Info(width = 0, height = 0, components = 0, progressive = false))
+        recover Info(width = 0, height = 0, components = 0, progressive = false)
     assert(refused)
 
 ## A smooth RGBA test picture with an edge, for the encoder.
@@ -322,7 +322,7 @@ test "a baseline picture streams its rows a group of MCU rows at a time, as it d
     # restart interval, gray, and a scaled decode.
     let width: usize = 301
     let height: usize = 1700
-    let pixels = try alloc u8[width * height * 4] in memory.heap
+    let pixels = try new u8[width * height * 4] --- in memory.heap
     defer free(pixels) in memory.heap
     for y in 0..<height:
         for x in 0..<width:
@@ -331,13 +331,13 @@ test "a baseline picture streams its rows a group of MCU rows at a time, as it d
             pixels[at + 1] = (u8)((y * 3 + x * x // 7) % 256)
             pixels[at + 2] = (u8)(((x + y) // 11) * 13 % 256)
             pixels[at + 3] = 255
-    let gray = try alloc u8[width * height] in memory.heap
+    let gray = try new u8[width * height] --- in memory.heap
     defer free(gray) in memory.heap
     for i in 0..<gray.length:
         gray[i] = pixels[i * 4 + 1]
-    let whole = try alloc u8[width * height * 4] in memory.heap
+    let whole = try new u8[width * height * 4] --- in memory.heap
     defer free(whole) in memory.heap
-    let streamed = try alloc u8[width * height * 4] in memory.heap
+    let streamed = try new u8[width * height * 4] --- in memory.heap
     defer free(streamed) in memory.heap
     for case in 0..<(usize)6:
         var encoded = Buffer()
@@ -378,7 +378,7 @@ test "the start of a file through its frame header is what info needs":
     let found = try info(data[..<have])
     assert(found.width == 64 and found.height == 48)
     var refused = false
-    discard(head_bytes(b"\x89PNG") catch failure:
+    _ = head_bytes(b"\x89PNG") catch failure:
         refused = failure.code == corrupt
-        recover 0)
+        recover 0
     assert(refused)

@@ -146,7 +146,7 @@ pub func probe(image: Raster*) -> !:
     image.width = found.width
     image.photo = (u64)found.components
     try image.standard(3 if found.components == 4 else found.components, .uint8)
-    discard(try image.validate())
+    _ = try image.validate()
     image.file_format = "JPEG"
 
 ## Decode a probed and allocated `image` into its f64 samples, on every processor.

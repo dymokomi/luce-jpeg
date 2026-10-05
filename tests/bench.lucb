@@ -16,7 +16,7 @@ pub func main(arguments: str[]) -> i32!:
     let file = try files.read((c.str)arguments[1])
     defer file.release()
     # A raster holds mutable bytes, so the benchmark lends it a copy.
-    let encoded = try alloc u8[file.value.length] in memory.heap
+    let encoded = try new u8[file.value.length] --- in memory.heap
     defer free(encoded) in memory.heap
     memory.copy(encoded, file.value, file.value.length)
     let repeats = (usize)(strings.parse_u64(arguments[2]) else 1) if arguments.length > 2 else 1
@@ -42,7 +42,7 @@ pub func main(arguments: str[]) -> i32!:
             try jpeg.decode_rows(encoded, discard_rows, (void*)&total, options = options)
         else:
             let pixel: usize = 4 if mode == "rgba" else 3
-            let out = try alloc u8[info.scaled_width(scale) * info.scaled_height(scale) * pixel] in memory.heap
+            let out = try new u8[info.scaled_width(scale) * info.scaled_height(scale) * pixel] --- in memory.heap
             if pixel == 4:
                 try jpeg.decode_rgba8(encoded, out, options)
             else:

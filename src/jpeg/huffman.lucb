@@ -94,16 +94,16 @@ struct Bits:
     ## The window a scan from a file reads through (jpeg/source).
     var window: Window*?
 
-    static func over(data: const u8[], position: usize) -> Bits:
+    func over(data: const u8[], position: usize) -> Bits:
         return Bits(data = data.data, end = data.length, pos = position, acc = 0, bits = 0, padded = 0, window = none)
 
     ## A scan's reader from `position` in the decoder's data, through its window if any.
-    static func reading(d: const Decoder*, position: usize) -> Bits:
+    func reading(d: const Decoder*, position: usize) -> Bits:
         return Bits(data = d.data.data, end = d.data.length, pos = position, acc = 0, bits = 0, padded = 0, window = d.window)
 
     ## Before an MCU of a scan from a file: the window slides on once less than
     ## an MCU's worst is left, so no MCU reads past it.
-    mutating func keep_up() -> !:
+    func keep_up() -> !:
         let window = self.window else return
         if self.end - self.pos >= window_margin or not window.more():
             return
@@ -113,7 +113,7 @@ struct Bits:
         self.pos = 0
 
     ## Top up to at least 57 bits.
-    mutating func fill():
+    func fill():
         var acc = self.acc
         var bits = self.bits
         let data = self.data
@@ -151,7 +151,7 @@ struct Bits:
         self.pos = pos
 
     ## `count` bits (1 through 16) as an unsigned value.
-    mutating func take(count: u32) -> u32:
+    func take(count: u32) -> u32:
         if self.bits < count:
             self.fill()
         let value = (u32)(self.acc >> (64 - count))
@@ -160,7 +160,7 @@ struct Bits:
         return value
 
     ## One bit.
-    mutating func bit() -> u32:
+    func bit() -> u32:
         if self.bits == 0:
             self.fill()
         let value = (u32)(self.acc >> 63)
@@ -169,7 +169,7 @@ struct Bits:
         return value
 
     ## The next Huffman symbol from `table`.
-    mutating func symbol(table: const Huffman*) -> u32!:
+    func symbol(table: const Huffman*) -> u32!:
         if self.bits < 16:
             self.fill()
         let entry = (u32)table.lookup[(usize)(self.acc >> peek)]
@@ -196,7 +196,7 @@ struct Bits:
 
     ## Past the restart marker `expected` (208..215) at the reader's position, with
     ## the bit buffer emptied.
-    mutating func restart(expected: u8) -> !:
+    func restart(expected: u8) -> !:
         if self.leftover():
             error(corrupt, "JPEG marker prefix missing")
         if self.pos >= self.end or self.data[self.pos] != 255:

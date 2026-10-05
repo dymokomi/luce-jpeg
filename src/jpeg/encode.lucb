@@ -75,7 +75,7 @@ pub func encode(image: const Raster*, output: Buffer*, quality: i64 = 90) -> !:
     # Samples to bytes a few rows at a time, rounded to the nearest.
     let chunk: usize = 64
     let row_bytes = image.width * nc
-    let bytes = try alloc u8[chunk * row_bytes] in memory.heap
+    let bytes = try new u8[chunk * row_bytes] --- in memory.heap
     defer free(bytes) in memory.heap
     var y: usize = 0
     while y < image.height:
@@ -121,7 +121,7 @@ pub struct Encoder:
     var finished: bool
 
     ## Start a `width` x `height` JPEG of `input` pixels at the end of `output`.
-    pub static func begin(width: usize, height: usize, input: Input, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
+    pub func begin(width: usize, height: usize, input: Input, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
         if width == 0 or height == 0 or width > 65535 or height > 65535 or options.quality < 1 or options.quality > 100:
             error(invalid, "JPEG dimensions or quality out of range")
         let pixel: usize = 4 if input == .rgba else 3 if input == .rgb else 1
@@ -140,7 +140,7 @@ pub struct Encoder:
         return encoder
 
     ## Push `count` rows of pixels, tightly packed.
-    pub mutating func write_rows(pixels: const u8[], count: usize) -> !:
+    pub func write_rows(pixels: const u8[], count: usize) -> !:
         let f = &self.frame
         let row_bytes = f.width * f.pixel
         if self.finished or self.received + count > f.height:
@@ -167,7 +167,7 @@ pub struct Encoder:
                     self.received += used
                     continue
             if self.rows.length == 0:
-                self.rows = try alloc u8[group_rows * row_bytes] in memory.heap
+                self.rows = try new u8[group_rows * row_bytes] --- in memory.heap
             let rows = group_rows - self.buffered if group_rows - self.buffered < count - taken else count - taken
             memory.copy(self.rows[self.buffered * row_bytes..], pixels[taken * row_bytes..], rows * row_bytes)
             self.buffered += rows
@@ -180,7 +180,7 @@ pub struct Encoder:
                 self.buffered = 0
 
     ## Complete the file once every row is in.
-    pub mutating func finish() -> !:
+    pub func finish() -> !:
         let f = &self.frame
         if self.finished:
             return
@@ -199,7 +199,7 @@ pub struct Encoder:
         try self.output.put(b"\xff\xd9")
         self.finished = true
 
-    pub mutating func close():
+    pub func close():
         for i in 0..<self.bands.length:
             if self.bands[i].blocks.length > 0:
                 free(self.bands[i].blocks) in memory.heap
@@ -215,7 +215,7 @@ pub struct Encoder:
         self.rows = none_rows
 
     ## Transform `count` MCU rows from `source` and, unless optimizing, code them.
-    mutating func encode_bands(source: const Source*, count: usize) -> !:
+    func encode_bands(source: const Source*, count: usize) -> !:
         var done: usize = 0
         while done < count:
             let n = self.group if done + self.group <= count else count - done
@@ -231,7 +231,7 @@ pub struct Encoder:
 
     ## Append band `index`'s stream to the file: its restart marker, its first MCU
     ## (unless the stream has it) and the rest.
-    mutating func join(band: Band*, index: usize) -> !:
+    func join(band: Band*, index: usize) -> !:
         let f = &self.frame
         try self.output.reserve(band.stream.used * 8 + f.mcu_blocks * 64 * 8 + 64)
         if f.restart and index > 0:
@@ -250,7 +250,7 @@ pub struct Encoder:
         self.predictors = band.last
 
     ## Count every band's symbols and fit the four tables to them.
-    mutating func fit_tables() -> !:
+    func fit_tables() -> !:
         let f = &self.frame
         var job = BandJob(encoder = &self, first_band = 0, counting = true)
         try run_tasks(band_task, (void*)&job, f.mcuy, self.threads)
@@ -264,7 +264,7 @@ pub struct Encoder:
             self.coding.ac[t] = optimal_table(total.ac[t * 257..<t * 257 + 257])
 
     ## Code kept bands `first..<first + count` whole and join them.
-    mutating func code_group(first: usize, count: usize) -> !:
+    func code_group(first: usize, count: usize) -> !:
         var job = BandJob(encoder = &self, first_band = first, coding = true)
         try run_tasks(band_task, (void*)&job, count, self.threads)
         if job.failed.load() != 0:
@@ -301,11 +301,11 @@ func band_task(context: void*, index: usize, scratch: Scratch*):
         band.stream.reset()
         band.whole = true
         if not code_mcus(f, &e.coding, band.blocks.data, 0, f.mcux, &predictors[0], &band.stream):
-            discard(job.failed.swap(1))
+            _ = job.failed.swap(1)
         return
     if band.blocks.length == 0:
-        band.blocks = alloc i16[f.band_blocks * 64] in memory.heap catch:
-            discard(job.failed.swap(1))
+        band.blocks = new i16[f.band_blocks * 64] --- in memory.heap catch:
+            _ = job.failed.swap(1)
             return
     let source = job.source else return
     transform_band(f, source, number, band.blocks.data, &band.last[0], scratch.bytes.data)
@@ -320,7 +320,7 @@ func band_task(context: void*, index: usize, scratch: Scratch*):
     band.stream.reset()
     band.whole = false
     if not code_mcus(f, &e.coding, band.blocks.data, 1, f.mcux, &predictors[0], &band.stream):
-        discard(job.failed.swap(1))
+        _ = job.failed.swap(1)
 
 ## Code MCUs `first..<last` of a band's blocks; false when the stream could not grow.
 func code_mcus(f: const EncodeFrame*, coding: const Coding*, blocks: const i16*, first: usize, last: usize, predictors: i32*, out: BitBuffer*) -> bool:

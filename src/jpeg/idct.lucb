@@ -23,7 +23,7 @@ struct Cosines:
     var table: f64[256]
     var by_frequency: f64[256]
 
-    static func make() -> Cosines:
+    func make() -> Cosines:
         var result = Cosines()
         for level in 0..<(usize)4:
             let n = (usize)1 << level

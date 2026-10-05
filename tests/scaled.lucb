@@ -37,12 +37,12 @@ func take_coarse(context: void*?, width: usize, height: usize, pixels: const u8[
     coarse.calls += 1
 
 func ignore_rows(context: void*?, first: usize, rows: usize, bytes: const u8[]) -> !:
-    discard(context)
+    _ = context
 
 ## `ReadAt` over an open file.
 func read_file(context: void*?, at: u64, into: u8[]) -> usize!:
     let file = (files.File*)(context else return 0)
-    discard(try file.seek((i64)at))
+    _ = try file.seek((i64)at)
     return try file.read(into)
 
 pub func main(arguments: str[]) -> i32!:
@@ -89,7 +89,7 @@ pub func main(arguments: str[]) -> i32!:
             print("rows out of order or missing")
             return 1
     else:
-        let out = try alloc u8[width * height * pixel] in memory.heap
+        let out = try new u8[width * height * pixel] --- in memory.heap
         defer free(out) in memory.heap
         if pixel == 4:
             try jpeg.decode_rgba8(encoded, out, options)

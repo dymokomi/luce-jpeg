@@ -35,11 +35,11 @@ pub func main(arguments: str[]) -> i32!:
     options.restart = strings.contains(flags, "r")
     options.optimize = strings.contains(flags, "o")
     # The picture: RGBA from the decoder, then RGB, gray or a Raster from that.
-    let rgba = try alloc u8[width * height * 4] in memory.heap
+    let rgba = try new u8[width * height * 4] --- in memory.heap
     defer free(rgba) in memory.heap
     try jpeg.decode_rgba8(encoded, rgba)
     let pixel: usize = 3 if mode == "rgb" or mode == "raster" else 1 if mode == "gray" else 4
-    let pixels = try alloc u8[width * height * pixel] in memory.heap
+    let pixels = try new u8[width * height * pixel] --- in memory.heap
     defer free(pixels) in memory.heap
     for i in 0..<width * height:
         if pixel == 1:

@@ -132,7 +132,7 @@ struct Cursor:
 
     ## A cursor for a reader standing at MCU `origin`, the start of a restart
     ## interval or of the scan; interval i ends at marker RST(i mod 8).
-    static func at(d: const Decoder*, origin: usize) -> Cursor:
+    func at(d: const Decoder*, origin: usize) -> Cursor:
         let interval = origin // d.restart if d.restart > 0 else 0
         return Cursor(predictors = i32[4](0), expected = (u8)(208 + interval % 8), origin = origin)
 
@@ -253,7 +253,7 @@ func parallel_intervals(d: Decoder*, scan: const Scan*, reader: Reader*) -> bool
         return false
     # A few slices a thread balances uneven intervals.
     let slices = intervals if intervals < threads * 4 else threads * 4
-    let jobs = try alloc IntervalJob[slices] in memory.heap
+    let jobs = try new IntervalJob[slices] --- in memory.heap
     defer free(jobs) in memory.heap
     for s in 0..<slices:
         jobs[s] = IntervalJob(d = d, scan = scan, starts = starts, stops = stops, first = s * intervals // slices, last = (s + 1) * intervals // slices, failed = false, message = "")

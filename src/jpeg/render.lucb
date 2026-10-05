@@ -65,7 +65,7 @@ func crew_start(task: func(void*, usize, Scratch*) -> unit, context: void*, coun
     var workers: usize = threads if threads < count else count
     workers = 64 if workers > 64 else (1 if workers == 0 else workers)
     let crew = try new Crew(pool = Pool(count = count, task = task, context = context)) in memory.heap
-    crew.slots = alloc Worker[workers] in memory.heap catch failure:
+    crew.slots = new Worker[workers] --- in memory.heap catch failure:
         free(crew) in memory.heap
         error(failure.code, failure.message)
     for i in 0..<workers:
@@ -86,7 +86,7 @@ func allocate_scratch(scratch: Scratch*, width: usize, column: usize, bytes: usi
         scratch.column = try new i32[column + 1] in memory.heap
         scratch.pixels = try new u8[4 * width] in memory.heap
     if bytes > 0:
-        scratch.bytes = try alloc u8[bytes] in memory.heap
+        scratch.bytes = try new u8[bytes] --- in memory.heap
 
 ## Work on the crew's tasks until none are left, join its threads and free it.
 func crew_finish(crew: Crew*) -> !:
@@ -190,7 +190,7 @@ func plan(d: Decoder*, target: const Target*, scale: usize, ring: usize = 0) -> 
             error(limit, "JPEG coefficient and sample buffers exceed byte limit")
         if c.plane.length > 0:
             free(c.plane) in memory.heap
-        c.plane = try alloc u8[c.stride * plane_rows] in memory.heap
+        c.plane = try new u8[c.stride * plane_rows] --- in memory.heap
     let job = try new RenderJob(d = d, target = target, cosines = Cosines.make(), width = width, height = height, band_rows = d.max_v * n, first_band = 0) in memory.heap
     for i in 0..<(usize)256:
         job.quant[i] = (f64)d.quant[i]
@@ -251,11 +251,11 @@ struct Gate:
     var opened: @u32
     var sleepers: sync.Semaphore
 
-    mutating func open():
+    func open():
         self.opened.store(1, .release)
         self.sleepers.release()
 
-    mutating func pass():
+    func pass():
         if self.opened.load(.acquire) == 0:
             # Take the permit `open` leaves and hand it on to the next waiter.
             self.sleepers.acquire()
