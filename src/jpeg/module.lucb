@@ -17,6 +17,8 @@
 #       the file in pieces), or to a Raster's f64 samples (`probe` then `decode`). Every route produces the same sample values,
 #       bit for bit those of the plain float decoder this one replaced.
 #
+#       `icc_profile` joins the ICC profile a JPEG carries in its APP2 segments.
+#
 #       Encoding takes 8-bit RGBA, RGB or gray rows at once (`encode_rgba8`...) or
 #       pushed in bands through an `Encoder`, and runs on every processor too.
 #
@@ -24,6 +26,7 @@
 #
 #       module.lucb       the public API
 #       headers.lucb      the decoder state, markers, frame, tables and scan headers
+#       profile.lucb      the ICC profile of APP2 "ICC_PROFILE" segments
 #       huffman.lucb      Huffman tables with 11-bit lookahead, and the 64-bit bit reader
 #       sequential.lucb   baseline scans, split across threads at restart markers
 #       progressive.lucb  spectral selection and successive approximation scans
@@ -110,7 +113,6 @@ pub func info(data: const u8[]) -> Info!:
             return Info(width = width, height = height, components = count, progressive = code == 194)
         if code >= 195 and code <= 207 and code != 196 and code != 200 and code != 204:
             error(unsupported, "lossless or arithmetic JPEG is not supported")
-    error(corrupt, "JPEG has no frame header")
 
 ## Bytes of the start of a file, whose first `data.length` are `data`, through
 ## its frame header: 0 when `data` holds it (or `info` will find there is none),
@@ -136,7 +138,6 @@ pub func head_bytes(data: const u8[]) -> usize!:
         if code >= 192 and code <= 207 and code != 196 and code != 200 and code != 204:
             return 0 if at + 2 + length <= data.length else at + 2 + length
         at += 2 + length
-    return 0
 
 ## Fill `image`'s size, channels (Y, or R G B for colour and CMYK) and format from
 ## its encoded bytes, ahead of `allocate` and `decode`.

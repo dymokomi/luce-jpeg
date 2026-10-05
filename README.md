@@ -45,6 +45,17 @@ Entropy decoding uses 11-bit Huffman lookahead with run, value and length for mo
 | progressive 4:2:0 q95 | 4934 ms | 289 ms | |
 | progressive 4:4:4 q90 | 5435 ms | 324 ms | |
 
+## ICC profiles
+
+```luce
+let profile = try jpeg.icc_profile(data)   # the APP2 "ICC_PROFILE" segments joined, or none; the caller frees it
+```
+
+The segments join as libjpeg-turbo's `jpeg_read_icc_profile` joins them, read when Ladybird's
+JPEGLoader reads them (after every scanline): the counts must agree, each sequence number from
+1 to the count must appear once, and the parts join in sequence order; a file of several scans
+counts the segments between and after its scans, a file of one scan only those before it.
+
 ## Encoding
 
 ```luce

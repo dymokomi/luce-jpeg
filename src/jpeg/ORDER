@@ -1,5 +1,6 @@
 module.lucb
 headers.lucb
+profile.lucb
 huffman.lucb
 sequential.lucb
 progressive.lucb

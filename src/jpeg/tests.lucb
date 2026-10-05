@@ -382,3 +382,36 @@ test "the start of a file through its frame header is what info needs":
         refused = failure.code == corrupt
         recover 0
     assert(refused)
+
+# mark: ICC profiles ===========================================================================
+from luce_std import files
+import c as libc
+import strings
+
+## The bytes of tests/fixtures/icc/NAME, kept in the heap for the run (tests run from the
+## repository root).
+func icc_fixture(name: str) -> const u8[]:
+    var buffer: u8[256]
+    let path = strings.format(buffer, f"tests/fixtures/icc/{name}") else trap("a fixture path is too long")
+    with memory.heap:
+        return (files.read((libc.str)path) else trap("cannot read an ICC fixture")).value
+
+## The profile joined from fixture `name`, or none; kept in the heap for the run.
+func joined_profile(name: str) -> u8[]?:
+    with memory.heap:
+        return icc_profile(icc_fixture(name)) else trap("the fixture's markers read")
+
+test "an ICC profile joins from its APP2 segments in sequence order":
+    let one = joined_profile("icc-one.jpg") else trap("one segment")
+    assert(one.length == 1000)
+    let names: str[6] = ["icc-three.jpg", "icc-reordered.jpg", "icc-other-app2.jpg", "icc-short-segment.jpg", "icc-one-empty-part.jpg", "icc-between-scans.jpg"]
+    for name in names:
+        let joined = joined_profile(name) else trap("the segments join")
+        assert((str)joined == (str)one)
+    let v4 = joined_profile("ladybird-icc-v4.jpg") else trap("Ladybird's profile")
+    assert(v4.length == 656 and (str)v4[36..<40] == "acsp")
+
+test "inconsistent ICC segments give no profile, as in libjpeg-turbo":
+    let names: str[9] = ["icc-duplicate.jpg", "icc-missing.jpg", "icc-counts-differ.jpg", "icc-sequence-zero.jpg", "icc-sequence-past-count.jpg", "icc-empty-parts.jpg", "icc-zero-count.jpg", "ladybird-gradient-empty-icc.jpg", "icc-before-eoi.jpg"]
+    for name in names:
+        assert(joined_profile(name) == none)

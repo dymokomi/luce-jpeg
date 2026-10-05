@@ -1,0 +1,122 @@
+#==============================================================================================
+#
+#   jpeg/profile - The ICC profile in APP2 "ICC_PROFILE" markers
+#
+#   DESCRIPTION:
+#       An ICC profile too long for one marker segment is split across APP2 segments, each
+#       starting "ICC_PROFILE\0", its sequence number (1-based) and the number of segments.
+#       `icc_profile` joins them as libjpeg-turbo's jpeg_read_icc_profile does: every ICC
+#       segment must agree on the count, carry a sequence number from 1 to the count, and no
+#       number may repeat or be missing; the parts join in sequence order, and a profile of
+#       no bytes is none. Ladybird's JPEGLoader asks after reading every scanline: a file of
+#       several scans has been read to its end by then (libjpeg absorbs them all before the
+#       first row), so its segments between and after scans count; a file of one scan has
+#       been read only through it, so only the segments before it count.
+#
+#==============================================================================================
+
+## The bytes that open an ICC marker segment before its sequence number and count.
+let icc_signature: str = "ICC_PROFILE\0"
+## The signature, the sequence number and the count (libjpeg-turbo's ICC_OVERHEAD_LEN).
+let icc_overhead: usize = 14
+
+## The segments of the file `data` with marker `code`, in order: each one's data, the
+## scans' entropy-coded bytes skipped, through the end of the file or (`one_scan`) the first
+## scan. Calls `visit` with `context` for each; the number of scans seen.
+func each_segment(data: const u8[], code: u8, visit: func(void*, const u8[]) -> unit, context: void*, one_scan: bool) -> usize!:
+    var r = Reader(data = data, little = false)
+    if try r.uint(2) != 65496:
+        error(corrupt, "invalid JPEG signature")
+    var scans: usize = 0
+    while r.position < data.length:
+        let found = try marker(&r)
+        if found == 217:
+            break
+        if found >= 208 and found <= 215:
+            continue
+        let s = try segment(&r)
+        if found == code:
+            visit(context, s.data)
+        if found == 218:
+            scans += 1
+            if one_scan:
+                break
+            # Entropy-coded data runs to the next marker other than a restart: 0xFF
+            # followed by a byte that is neither a stuffed 0 nor RST0..7.
+            var at = r.position
+            while at + 1 < data.length:
+                if data[at] == 255 and data[at + 1] != 0 and not (data[at + 1] >= 208 and data[at + 1] <= 215):
+                    if data[at + 1] == 255:
+                        at += 1
+                        continue
+                    break
+                at += 1
+            r.position = at
+    return scans
+
+## What the first pass over the ICC segments found (marker_present, data_length).
+struct IccParts:
+    var count: usize
+    var present: bool[256]
+    var lengths: usize[256]
+    var offsets: usize[256]
+    var bogus: bool
+    ## The second pass: the profile being joined.
+    var joined: u8[]
+
+## Whether a segment's data `part` is an ICC marker's (marker_is_icc).
+func is_icc(part: const u8[]) -> bool:
+    return part.length >= icc_overhead and (str)part[..<12] == icc_signature
+
+func ignore(context: void*, part: const u8[]):
+    _ = context
+    _ = part
+
+func count_icc(context: void*, part: const u8[]):
+    let parts = (IccParts*)context
+    if not is_icc(part) or parts.bogus:
+        return
+    if parts.count == 0:
+        parts.count = (usize)part[13]
+    elif parts.count != (usize)part[13]:
+        # Inconsistent counts.
+        parts.bogus = true
+        return
+    let sequence = (usize)part[12]
+    if sequence == 0 or sequence > parts.count or parts.present[sequence]:
+        # A bogus or repeated sequence number.
+        parts.bogus = true
+        return
+    parts.present[sequence] = true
+    parts.lengths[sequence] = part.length - icc_overhead
+
+func join_icc(context: void*, part: const u8[]):
+    let parts = (IccParts*)context
+    if not is_icc(part):
+        return
+    let sequence = (usize)part[12]
+    let length = parts.lengths[sequence]
+    memory.copy(parts.joined[parts.offsets[sequence]..], part[icc_overhead..], length)
+
+## The ICC profile of the JPEG in `data`, joined from its APP2 segments as libjpeg-turbo's
+## jpeg_read_icc_profile joins them, in a buffer of the current allocator the caller frees;
+## none when there is none or the segments are inconsistent.
+pub func icc_profile(data: const u8[]) -> u8[]?!:
+    var parts = IccParts()
+    let one_scan = try each_segment(data, 218, ignore, (void*)&parts, false) == 1
+    _ = try each_segment(data, 226, count_icc, (void*)&parts, one_scan)
+    if parts.bogus or parts.count == 0:
+        return none
+    # Check for missing segments, and lay the parts out.
+    var total: usize = 0
+    for sequence in 1..=parts.count:
+        if not parts.present[sequence]:
+            return none
+        parts.offsets[sequence] = total
+        total += parts.lengths[sequence]
+    if total == 0:
+        # Only empty segments.
+        return none
+    parts.joined = try new u8[total] ---
+    _ = try each_segment(data, 226, join_icc, (void*)&parts, one_scan)
+    return parts.joined

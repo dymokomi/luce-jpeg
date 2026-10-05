@@ -425,16 +425,6 @@ func idct_group_task(context: void*, index: usize, scratch: Scratch*):
     let job = (RenderJob*)context
     idct_band(job, job.first_band + index)
 
-## Free the components' coefficients once every IDCT is done.
-func release_coefficients(d: Decoder*):
-    for i in 0..<d.count:
-        let c = &d.components[i]
-        release_bands(c)
-        if c.nonzero.length > 0:
-            free(c.nonzero) in memory.heap
-            var none_left: u64[]
-            c.nonzero = none_left
-
 ## Render a completely read decoder into its target.
 func render(d: Decoder*) -> !:
     let target = d.target else trap("render without a target")

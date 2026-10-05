@@ -1,0 +1,44 @@
+## The ICC profile luce-jpeg joins from JPEGs, printed as the libjpeg-turbo oracle prints it
+## (luce-browser-tools/oracles/luce-jpeg/icc): `icc_tool FILE...`, one line a file,
+## `NAME icc=LENGTH:FNV1A`, `NAME icc=-` or `NAME error`.
+from luce_std import files
+import c
+import memory
+import jpeg
+
+## FNV-1a of `data`.
+func fnv(data: const u8[]) -> u32:
+    var h: u32 = 2166136261
+    for b in data:
+        h = (h ^ (u32)b) *% 16777619
+    return h
+
+func name_of(path: str) -> str:
+    let bytes = path.bytes
+    var start: usize = 0
+    for i in 0..<bytes.length:
+        if bytes[i] == '/':
+            start = i + 1
+    return (str)bytes[start..]
+
+func show(path: str) -> !:
+    let read = try files.read((c.str)path)
+    defer read.release()
+    var failed = false
+    var profile: u8[]? = none
+    with memory.heap:
+        profile = jpeg.icc_profile(read.value) catch:
+            failed = true
+            recover none
+    if failed:
+        print(f"{name_of(path)} error")
+    elif let bytes = profile:
+        print(f"{name_of(path)} icc={bytes.length}:{fnv(bytes):08x}")
+        free(bytes) in memory.heap
+    else:
+        print(f"{name_of(path)} icc=-")
+
+pub func main(arguments: str[]) -> i32!:
+    for i in 1..<arguments.length:
+        try show(arguments[i])
+    return 0

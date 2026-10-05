@@ -20,7 +20,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BASE = Path(os.environ.get("LUCE_BASE", ROOT.parent / "luce-base/build/luce-base")).resolve()
 MODES = [["--native"], ["--backend=c"]]
-env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=str((ROOT.parent / "luce-base/src/std").resolve()))
+env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=os.environ.get("LUCE_STD", str((ROOT.parent / "luce-base/src/std").resolve())))
 FIXTURES = sorted((ROOT / "tests/fixtures").glob("*.jpg"))
 GOLDEN = {}
 for line in (ROOT / "tests/fixtures/golden.txt").read_text().splitlines():
@@ -247,8 +247,22 @@ def check_encoder(tmp, flags, scaled):
     print(f"ok    {checked} encodings identical across threads and streaming, decoding close to their source")
 
 
+def check_icc(tmp, flags):
+    """The ICC profiles of tests/fixtures/icc join as libjpeg-turbo joins them (expected.txt,
+    from luce-browser-tools/oracles/luce-jpeg/icc)."""
+    tool = tmp / "icc_tool"
+    run([BASE, "build", ROOT / "tests/icc_tool.lucb", *flags, "-o", tool], check=True)
+    folder = ROOT / "tests/fixtures/icc"
+    names = sorted(p.name for p in folder.glob("*.jpg"))
+    found = subprocess.run([str(tool), *names], cwd=folder, env=env, capture_output=True, timeout=300, check=True).stdout.decode()
+    if found != (folder / "expected.txt").read_text():
+        fail("the joined ICC profiles differ from libjpeg-turbo's (tests/fixtures/icc/expected.txt)")
+    print(f"ok    {len(names)} JPEGs' ICC profiles joined as libjpeg-turbo joins them")
+
+
 for flags in MODES:
     run([BASE, "test", ROOT / "src/jpeg", *flags], check=True)
     with tempfile.TemporaryDirectory(prefix="luce-jpeg-") as tmp:
         check_drivers(Path(tmp), flags)
+        check_icc(Path(tmp), flags)
 print("PASS luce-jpeg")

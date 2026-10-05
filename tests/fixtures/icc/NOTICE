@@ -1,0 +1,13 @@
+JPEGs carrying ICC profiles in APP2 segments, for jpeg/profile's tests (src/jpeg/tests.lucb,
+tests/run.py).
+
+Written by tests/make_icc_fixtures.py from this repository's own b444_7x9.jpg and
+p420_37x35.jpg (no third-party data): every icc-*.jpg.
+
+From Ladybird (Tests/LibGfx/test-inputs; BSD 2-Clause License, LICENSE-ladybird):
+  ladybird-icc-v4.jpg              icc/icc-v4.jpg
+  ladybird-gradient-empty-icc.jpg  jpg/gradient_empty_icc.jpg
+
+expected.txt is what libjpeg-turbo (Ladybird's, through its vcpkg tree) joins from each with
+jpeg_read_icc_profile after reading every scanline, as Ladybird's JPEGLoader does:
+luce-browser-tools/oracles/luce-jpeg/icc/libjpeg_oracle.
