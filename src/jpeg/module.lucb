@@ -6,7 +6,7 @@
 #       8-bit Huffman JPEG: sequential and progressive scans, restart markers, grayscale,
 #       YCbCr, RGB, CMYK and YCCK, any sampling factors. Decoding runs in three stages:
 #       entropy decoding into quantized coefficients, an exact separable f64 IDCT into
-#       component planes, and upsampling with colour conversion into output rows. The
+#       component planes, and upsampling with color conversion into output rows. The
 #       last two run in MCU-row bands on every processor: for a baseline picture while
 #       the calling thread is still entropy-decoding later rows, and restart intervals
 #       entropy-decode on every processor too. A decode can be scaled to 1/2, 1/4 or 1/8
@@ -31,11 +31,11 @@
 #       sequential.lucb   baseline scans, split across threads at restart markers
 #       progressive.lucb  spectral selection and successive approximation scans
 #       idct.lucb         the exact separable IDCT, full size and DCT-scaled
-#       color.lucb        upsampling and colour conversion of one output row
+#       color.lucb        upsampling and color conversion of one output row
 #       render.lucb       the worker crew, render geometry, the band schedule, targets
 #       source.lucb       decoding from a file read in pieces (`decode_rows_at`)
 #       encode.lucb       the encoder's API, band orchestration and file header
-#       encode_transform.lucb  colour conversion, downsampling, the quantized AAN DCT
+#       encode_transform.lucb  color conversion, downsampling, the quantized AAN DCT
 #       encode_entropy.lucb    Huffman tables, optimal tables, bit streams and joining
 #       tests.lucb        the module's tests
 #
@@ -139,7 +139,7 @@ pub func head_bytes(data: const u8[]) -> usize!:
             return 0 if at + 2 + length <= data.length else at + 2 + length
         at += 2 + length
 
-## Fill `image`'s size, channels (Y, or R G B for colour and CMYK) and format from
+## Fill `image`'s size, channels (Y, or R G B for color and CMYK) and format from
 ## its encoded bytes, ahead of `allocate` and `decode`.
 pub func probe(image: Raster*) -> !:
     let found = try info(image.encoded)

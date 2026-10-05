@@ -1,6 +1,6 @@
 #==============================================================================================
 #
-#   jpeg/encode_transform - Colour conversion, downsampling and the quantized forward DCT
+#   jpeg/encode_transform - Color conversion, downsampling and the quantized forward DCT
 #
 #   DESCRIPTION:
 #       One band (an MCU row) of input pixels becomes quantized blocks. RGB converts to

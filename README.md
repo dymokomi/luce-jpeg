@@ -33,7 +33,7 @@ try jpeg.decode(&raster)
 
 ## How it is fast
 
-Entropy decoding uses 11-bit Huffman lookahead with run, value and length for most AC coefficients in one lookup, and a 64-bit bit reader refilled several bytes at a time. Restart intervals decode on every processor. For a baseline picture in one interleaved scan, the calling thread entropy-decodes MCU rows while workers run the IDCT and colour conversion of finished rows, so rendering hides behind entropy decoding. The IDCT skips zero coefficients and rows (which only omits additions of zero); progressive refinement walks a bitmap of nonzero coefficients.
+Entropy decoding uses 11-bit Huffman lookahead with run, value and length for most AC coefficients in one lookup, and a 64-bit bit reader refilled several bytes at a time. Restart intervals decode on every processor. For a baseline picture in one interleaved scan, the calling thread entropy-decodes MCU rows while workers run the IDCT and color conversion of finished rows, so rendering hides behind entropy decoding. The IDCT skips zero coefficients and rows (which only omits additions of zero); progressive refinement walks a bitmap of nonzero coefficients.
 
 24 MP on an M4 Max (16 cores), `tests/bench.lucb`:
 
@@ -74,7 +74,7 @@ try jpeg.encode(&raster, &out, quality = 90)                  # a Raster, 4:4:4 
 
 - `EncodeOptions`: `quality` 1..100 (Annex K tables scaled as IJG does), `subsampling` `.s444`/`.s422`/`.s420` (default 4:2:0; ignored for gray), `restart` (a marker after every MCU row, so decoders can split entropy decoding: this one decodes such a file a third faster), `optimize` (Huffman tables fitted in a second pass, about 3% smaller; keeps every block until `finish`), `threads`.
 - An `Encoder` holds a few MCU rows a thread; rows come straight from the caller's buffer when whole groups arrive. Every route, thread count and push size gives the same bytes.
-- Colour conversion, downsampling, the quantized AAN forward DCT and Huffman coding of each MCU row run on every processor into separate bit streams; the calling thread joins them with byte stuffing and the rows' first MCUs.
+- Color conversion, downsampling, the quantized AAN forward DCT and Huffman coding of each MCU row run on every processor into separate bit streams; the calling thread joins them with byte stuffing and the rows' first MCUs.
 
 24 MP from an M4 Max, `tests/encode.lucb` (PSNR against the source):
 

@@ -6,8 +6,8 @@
 #       Rendering runs in MCU-row bands on every processor, the calling thread one of
 #       the workers: the IDCT of a band's blocks into component planes, and the band's
 #       output rows. A band's rows interpolate one plane row into each neighbouring
-#       band, so its colour task waits for the IDCT of those. Tasks are handed out in
-#       the order I0, I1, C0, I2, C1, ... (IDCT, colour one band behind).
+#       band, so its color task waits for the IDCT of those. Tasks are handed out in
+#       the order I0, I1, C0, I2, C1, ... (IDCT, color one band behind).
 #
 #       For a baseline picture coded in one interleaved scan, the calling thread
 #       entropy-decodes MCU rows while the workers render the rows it has finished, so
@@ -15,7 +15,7 @@
 #
 #       Row callbacks from the frame's one interleaved baseline scan stream: the calling
 #       thread entropy-decodes a group of MCU rows into a ring of coefficients, the workers
-#       transform and colour them, and the rows go to the callback before the next group
+#       transform and color them, and the rows go to the callback before the next group
 #       is decoded, so the first rows arrive at once and a few MCU rows are all it holds.
 #       Other row callbacks render in groups of bands into one buffer after decoding and
 #       hand each group on in order.
@@ -143,7 +143,7 @@ struct RenderJob:
     var target: const Target*
     var cosines: Cosines
     var quant: f64[256]
-    ## The output size, output rows a band, and the band colour task 0 renders.
+    ## The output size, output rows a band, and the band color task 0 renders.
     var width: usize
     var height: usize
     var band_rows: usize
@@ -261,11 +261,11 @@ struct Gate:
             self.sleepers.acquire()
             self.sleepers.release()
 
-## IDCT and colour tasks for every band, with the waits between them. A waiter
+## IDCT and color tasks for every band, with the waits between them. A waiter
 ## sleeps at the one band gate it needs, so a band finishing wakes only its own.
 struct Schedule:
     var job: RenderJob*
-    ## MCU rows: IDCT bands. Colour bands can be fewer (padding rows).
+    ## MCU rows: IDCT bands. Color bands can be fewer (padding rows).
     var bands: usize
     var color_bands: usize
     ## Per band: its coefficients are complete; its IDCT is done.
@@ -373,8 +373,8 @@ func streams(d: const Decoder*, scan: const Scan*) -> bool:
 
 ## Decode a streaming scan a group of MCU rows at a time: coefficients into a
 ## ring of the group's rows, transformed into a ring of planes two MCU rows
-## longer (a band's colour reads the rows either side), and every band whose
-## next row is in coloured and handed on.
+## longer (a band's color reads the rows either side), and every band whose
+## next row is in colored and handed on.
 func streamed_scan(d: Decoder*, scan: const Scan*, reader: Reader*) -> !:
     try check_tables(d, scan)
     let target = d.target else trap("a streamed scan has a target")
@@ -441,8 +441,8 @@ func render(d: Decoder*) -> !:
 
 ## Render a completely read decoder to a row sink a group of MCU rows at a
 ## time, as a streamed scan does: the IDCT into a ring of planes two MCU rows
-## longer than the group (a band's colour reads the rows either side), and
-## every band whose next row is in coloured and handed on. The planes stay a
+## longer than the group (a band's color reads the rows either side), and
+## every band whose next row is in colored and handed on. The planes stay a
 ## few rows, whatever the picture, and each MCU row's coefficients go once its
 ## planes are made, as the rows made from them go out.
 func render_rows(d: Decoder*, target: Target*, deliver: RowSink) -> !:

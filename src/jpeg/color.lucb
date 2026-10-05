@@ -1,12 +1,12 @@
 #==============================================================================================
 #
-#   jpeg/color - Upsampling and colour conversion of one output row
+#   jpeg/color - Upsampling and color conversion of one output row
 #
 #   DESCRIPTION:
 #       A component sample at an output pixel is the bilinear interpolation of its
 #       plane at the pixel's centre, (x + 0.5) * num/den - 0.5, clamped to the samples
 #       that cover the picture: libjpeg's "fancy" triangle filter for 2:1 subsampling.
-#       Colour conversion is the JFIF YCbCr matrix in f64 (or Adobe's RGB, CMYK and
+#       Color conversion is the JFIF YCbCr matrix in f64 (or Adobe's RGB, CMYK and
 #       YCCK), rounded to the nearest 8-bit value.
 #
 #       For the common 1:1 and 2:1 ratios every weight is a multiple of 1/4, so the

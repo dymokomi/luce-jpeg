@@ -115,7 +115,7 @@ test "row callbacks deliver every row in order":
         recover ()
     assert(failed)
 
-test "scaled decodes have the scaled size and keep a flat colour":
+test "scaled decodes have the scaled size and keep a flat color":
     var raster = Raster()
     defer raster.close()
     raster.width = 40
@@ -248,7 +248,7 @@ test "every encoder option decodes close to the source":
             var decoded: u8[4500]
             try decode_rgb8(out.view(), decoded)
             let (mean, worst) = compare_pixels(rgba, decoded, 1500)
-            # Halved chroma blurs the hard colour edge; elsewhere the error is small.
+            # Halved chroma blurs the hard color edge; elsewhere the error is small.
             if sampling == .s444:
                 assert(mean <= 1 and worst <= 12)
             else:
