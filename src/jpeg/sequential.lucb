@@ -132,7 +132,7 @@ struct Cursor:
 
     ## A cursor for a reader standing at MCU `origin`, the start of a restart
     ## interval or of the scan; interval i ends at marker RST(i mod 8).
-    func at(d: const Decoder*, origin: usize) -> Cursor:
+    static func at(d: const Decoder*, origin: usize) -> Cursor:
         let interval = origin // d.restart if d.restart > 0 else 0
         return Cursor(predictors = i32[4](0), expected = (u8)(208 + interval % 8), origin = origin)
 

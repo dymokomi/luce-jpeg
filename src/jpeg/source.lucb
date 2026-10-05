@@ -33,7 +33,7 @@ struct Window:
     var at: u64
     var length: usize
 
-    func open(read: ReadAt, source: void*?, size: u64) -> Window!:
+    static func open(read: ReadAt, source: void*?, size: u64) -> Window!:
         var window = Window(read = read, source = source, size = size, buffer = try new u8[window_bytes] --- in memory.heap, at = 0, length = 0)
         window.fill() catch failure:
             window.close()

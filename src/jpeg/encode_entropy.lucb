@@ -33,7 +33,7 @@ struct CodeTable:
     var size: u8[256]
 
     ## A table from code counts by length and symbols in code order.
-    func make(counts: const u8[], values: const u8[]) -> CodeTable:
+    static func make(counts: const u8[], values: const u8[]) -> CodeTable:
         var table = CodeTable()
         var code: u32 = 0
         var k: usize = 0

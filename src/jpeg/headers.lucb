@@ -261,7 +261,7 @@ struct Decoder:
     ## Coefficients for every block, where a streamed scan left them unmade.
     func whole_coefficients() -> !:
         for i in 0..<self.count:
-            let c: Component* = &self.components[i]
+            let c = &self.components[i]
             if c.bands.length == 0:
                 try allocate_bands(c, self.mcuy)
 

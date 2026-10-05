@@ -48,7 +48,7 @@ struct EncodeFrame:
     var optimize: bool
 
     ## The frame for a picture; `quality` 1..100 scales the Annex K tables as IJG does.
-    func make(width: usize, height: usize, pixel: usize, subsampling: Subsampling, quality: i64, restart: bool, optimize: bool) -> EncodeFrame:
+    static func make(width: usize, height: usize, pixel: usize, subsampling: Subsampling, quality: i64, restart: bool, optimize: bool) -> EncodeFrame:
         var f = EncodeFrame(width = width, height = height, pixel = pixel, count = 1 if pixel == 1 else 3, h = 1, v = 1, restart = restart, optimize = optimize)
         if f.count == 3:
             f.h = 1 if subsampling == .s444 else 2

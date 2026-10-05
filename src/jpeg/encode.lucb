@@ -121,7 +121,7 @@ pub struct Encoder:
     var finished: bool
 
     ## Start a `width` x `height` JPEG of `input` pixels at the end of `output`.
-    pub func begin(width: usize, height: usize, input: Input, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
+    pub static func begin(width: usize, height: usize, input: Input, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
         if width == 0 or height == 0 or width > 65535 or height > 65535 or options.quality < 1 or options.quality > 100:
             error(invalid, "JPEG dimensions or quality out of range")
         let pixel: usize = 4 if input == .rgba else 3 if input == .rgb else 1
