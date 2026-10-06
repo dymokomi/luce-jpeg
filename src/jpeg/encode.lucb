@@ -41,6 +41,10 @@ pub struct EncodeOptions:
     pub var optimize: bool = false
     ## Worker threads, counting the caller's; 0 uses every processor.
     pub var threads: usize = 0
+    ## An ICC profile to embed (APP2 ICC_PROFILE segments, as the ICC spec chunks
+    ## them), telling readers the pixels' color space; empty for none. Borrowed
+    ## until the encode finishes.
+    pub var icc_profile: const u8[]
 
 ## Encode `width` x `height` RGBA pixels (row after row) as a JPEG appended to `output`.
 pub func encode_rgba8(pixels: const u8[], width: usize, height: usize, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> !:
@@ -119,13 +123,15 @@ pub struct Encoder:
     var writer: Stuffer
     var predictors: i32[3]
     var finished: bool
+    ## The ICC profile the header embeds (EncodeOptions.icc_profile).
+    var profile: const u8[]
 
     ## Start a `width` x `height` JPEG of `input` pixels at the end of `output`.
     pub static func begin(width: usize, height: usize, input: Input, output: Buffer*, options: EncodeOptions = EncodeOptions()) -> Encoder!:
         if width == 0 or height == 0 or width > 65535 or height > 65535 or options.quality < 1 or options.quality > 100:
             error(invalid, "JPEG dimensions or quality out of range")
         let pixel: usize = 4 if input == .rgba else 3 if input == .rgb else 1
-        var encoder = Encoder(frame = EncodeFrame.make(width, height, pixel, options.subsampling, options.quality, options.restart, options.optimize), output = output, threads = thread_count(options.threads, width * height), writer = Stuffer(out = output, acc = 0, bits = 0))
+        var encoder = Encoder(frame = EncodeFrame.make(width, height, pixel, options.subsampling, options.quality, options.restart, options.optimize), output = output, threads = thread_count(options.threads, width * height), writer = Stuffer(out = output, acc = 0, bits = 0), profile = options.icc_profile)
         let f = &encoder.frame
         encoder.group = encoder.threads * 2 if encoder.threads * 2 < f.mcuy else f.mcuy
         encoder.coding.sizes = magnitude_bits()
@@ -365,6 +371,7 @@ func write_header(e: Encoder*) -> !:
     let tables: usize = 1 if f.count == 1 else 2
     try output.put(b"\xff\xd8")
     try emit_segment(output, 224, b"JFIF\0\x01\x01\0\0\x01\0\x01\0\0")
+    try write_profile(output, e.profile)
     var data = Buffer()
     defer data.close()
     for t in 0..<tables:
@@ -401,6 +408,29 @@ func write_header(e: Encoder*) -> !:
         try data.byte(0 if c == 0 else 17)
     try data.put(b"\0\x3f\0")
     try emit_segment(output, 218, data.view())
+
+## The most profile bytes one APP2 segment holds: 65535 less the length field, the
+## "ICC_PROFILE\0" tag and the chunk's number and count.
+let profile_chunk: usize = 65519
+
+## `profile` as APP2 ICC_PROFILE segments, numbered from 1, each saying how many there are.
+func write_profile(output: Buffer*, profile: const u8[]) -> !:
+    if profile.length == 0:
+        return
+    let count = (profile.length + profile_chunk - 1) // profile_chunk
+    if count > 255:
+        error(invalid, "an ICC profile in a JPEG is at most 255 segments")
+    var data = Buffer()
+    defer data.close()
+    for at in 0..<count:
+        data.used = 0
+        try data.put(b"ICC_PROFILE\0")
+        try data.byte((u8)(at + 1))
+        try data.byte((u8)count)
+        let start = at * profile_chunk
+        let end = start + profile_chunk if start + profile_chunk < profile.length else profile.length
+        try data.put(profile[start..<end])
+        try emit_segment(output, 226, data.view())
 
 func emit_segment(output: Buffer*, code: u8, data: const u8[]) -> !:
     try output.byte(255)

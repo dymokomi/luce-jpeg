@@ -415,3 +415,22 @@ test "inconsistent ICC segments give no profile, as in libjpeg-turbo":
     let names: str[9] = ["icc-duplicate.jpg", "icc-missing.jpg", "icc-counts-differ.jpg", "icc-sequence-zero.jpg", "icc-sequence-past-count.jpg", "icc-empty-parts.jpg", "icc-zero-count.jpg", "ladybird-gradient-empty-icc.jpg", "icc-before-eoi.jpg"]
     for name in names:
         assert(joined_profile(name) == none)
+
+test "an embedded ICC profile reads back, across segments":
+    var profile = try new u8[70000] in memory.heap
+    defer free(profile) in memory.heap
+    for at in 0..<profile.length:
+        profile[at] = (u8)(at % 251)
+    var pixels: u8[48]
+    var output = Buffer()
+    defer output.close()
+    try encode_rgb8(pixels, 4, 4, &output, EncodeOptions(icc_profile = profile))
+    let read = (try icc_profile(output.data[..<output.used])) else trap("the profile did not read back")
+    defer free(read)
+    assert(read.length == profile.length)
+    for at in 0..<read.length:
+        assert(read[at] == profile[at])
+    var plain = Buffer()
+    defer plain.close()
+    try encode_rgb8(pixels, 4, 4, &plain)
+    assert((try icc_profile(plain.data[..<plain.used])) == none)
