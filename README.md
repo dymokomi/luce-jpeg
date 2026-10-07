@@ -90,7 +90,7 @@ try jpeg.encode(&raster, &out, quality = 90)                  # a Raster, 4:4:4 
 ## Tests
 
 ```
-./test.sh    # the module's tests, then the drivers in native and C modes against tests/fixtures
+luc test     # the module's tests, then tests/drivers in native and C modes against tests/fixtures
 ```
 
 `tests/fixtures/golden.txt` holds the 0.1 decoder's output for every fixture; `tests/make_fixtures.py` made the fixtures with Pillow, cjpeg and TurboJPEG. With Pillow installed the gate also compares full-size and scaled decodes with libjpeg's (within 4). `tests/bench.lucb` times a decode: `bench <file.jpg> [repeats] [raster|rgba|rgb|rows] [scale] [threads]`; `tests/encode.lucb` times encoding a decoded picture: `encode <in.jpg> <out.jpg> [repeats] [raster|rgba|rgb|gray|stream] [quality] [444|422|420] [r|o|ro|-] [threads]`. The gate also checks that encodings are identical across threads and streaming and as close to the source as libjpeg's.

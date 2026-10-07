@@ -4,7 +4,7 @@
 #
 #   DESCRIPTION:
 #       Small pictures made by the module's own encoder, through every decoding API.
-#       tests/run.py covers files from other encoders, threads, sampling factors,
+#       tests/drivers covers files from other encoders, threads, sampling factors,
 #       progressive coding, restart markers and damaged data.
 #
 #==============================================================================================

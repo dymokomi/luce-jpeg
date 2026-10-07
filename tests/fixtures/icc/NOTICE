@@ -1,5 +1,5 @@
 JPEGs carrying ICC profiles in APP2 segments, for jpeg/profile's tests (src/jpeg/tests.lucb,
-tests/run.py).
+tests/drivers).
 
 Written by tests/make_icc_fixtures.py from this repository's own b444_7x9.jpg and
 p420_37x35.jpg (no third-party data): every icc-*.jpg.

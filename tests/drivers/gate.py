@@ -17,10 +17,10 @@ and C modes against the fixtures:
 import hashlib, io, os, random, struct, subprocess, sys, tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-BASE = Path(os.environ.get("LUCE_BASE", ROOT.parent / "luce-base/build/luce-base")).resolve()
+ROOT = Path(__file__).resolve().parents[2]
+BASE = os.environ.get("LUCE_BASE", "luce-base")
 MODES = [["--native"], ["--backend=c"]]
-env = dict(os.environ, LUCE_BASE=str(BASE), LUCE_STD=os.environ.get("LUCE_STD", str((ROOT.parent / "luce-base/src/std").resolve())))
+env = dict(os.environ, LUCE_BASE=str(BASE))
 FIXTURES = sorted((ROOT / "tests/fixtures").glob("*.jpg"))
 GOLDEN = {}
 for line in (ROOT / "tests/fixtures/golden.txt").read_text().splitlines():
@@ -261,7 +261,6 @@ def check_icc(tmp, flags):
 
 
 for flags in MODES:
-    run([BASE, "test", ROOT / "src/jpeg", *flags], check=True)
     with tempfile.TemporaryDirectory(prefix="luce-jpeg-") as tmp:
         check_drivers(Path(tmp), flags)
         check_icc(Path(tmp), flags)
