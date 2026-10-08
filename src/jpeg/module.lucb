@@ -44,6 +44,7 @@ import memory
 from luce_std import math
 import thread
 import os
+import strings
 import sync
 from luce_raster.binary import Reader, Buffer
 from luce_raster.model import Raster

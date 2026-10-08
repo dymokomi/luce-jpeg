@@ -386,7 +386,6 @@ test "the start of a file through its frame header is what info needs":
 # mark: ICC profiles ===========================================================================
 from luce_std import files
 import c as libc
-import strings
 
 ## The bytes of tests/fixtures/icc/NAME, kept in the heap for the run (tests run from the
 ## repository root).

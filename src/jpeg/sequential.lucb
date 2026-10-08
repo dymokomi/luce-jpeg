@@ -168,7 +168,9 @@ struct IntervalJob:
     var first: usize
     var last: usize
     var failed: bool
+    ## Why it failed: a failure's message is copied into `room`, since the handler that caught it gives the original back when it finishes (base.md §11.3).
     var message: str
+    var room: u8[256]
 
 func interval_task(context: void*, index: usize, scratch: Scratch*):
     let jobs = (IntervalJob*)context
@@ -180,7 +182,7 @@ func interval_task(context: void*, index: usize, scratch: Scratch*):
     var cursor = Cursor.at(job.d, job.first * restart)
     sequential_range(job.d, job.scan, &b, &cursor, job.first * restart, last_mcu) catch failure:
         job.failed = true
-        job.message = failure.message
+        job.message = strings.copy_into(job.room, failure.message)
         return
     if b.leftover() or b.pos != job.stops[job.last - 1]:
         job.failed = true
